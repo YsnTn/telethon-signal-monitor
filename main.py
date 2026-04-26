@@ -2,13 +2,11 @@ import os
 import asyncio
 import json
 from telethon import TelegramClient, events
-from telethon.tl.types import Channel
 import anthropic
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 
-# Environment variables
 API_ID = int(os.environ.get('API_ID'))
 API_HASH = os.environ.get('API_HASH')
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
@@ -17,19 +15,15 @@ ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
 GOOGLE_CREDENTIALS = os.environ.get('GOOGLE_CREDENTIALS')
 SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
 
-# Initialize Anthropic
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# Initialize Google Sheets
 def get_sheets():
     creds_dict = json.loads(GOOGLE_CREDENTIALS)
-    scope = ['https://spreadsheets.google.com/feeds',
-             'https://www.googleapis.com/auth/drive']
+    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     client = gspread.authorize(creds)
     return client.open_by_key(SPREADSHEET_ID)
 
-# Check if channel is in SignalChannels sheet
 def is_signal_channel(username):
     try:
         sheet = get_sheets()
@@ -43,7 +37,6 @@ def is_signal_channel(username):
         print(f"Error checking signal channel: {e}")
         return False
 
-# Add new channel to SignalChannels sheet
 def add_signal_channel(username, name):
     try:
         sheet = get_sheets()
@@ -53,7 +46,6 @@ def add_signal_channel(username, name):
     except Exception as e:
         print(f"Error adding channel: {e}")
 
-# Check channel history with Claude
 def analyze_channel_history(messages):
     text = '\n'.join(messages[:50])
     response = claude.messages.create(
@@ -68,48 +60,33 @@ Messages:
 {text}
 
 Respond in JSON only:
-{{"is_signal_channel": true/false, "confidence": 0-100, "reason": "brief reason"}}"""
+{{"is_signal_channel": true, "confidence": 85, "reason": "brief reason"}}"""
         }]
     )
     try:
         return json.loads(response.content[0].text)
-    except:
+    except Exception:
         return {"is_signal_channel": False, "confidence": 0, "reason": "Parse error"}
 
-# Extract signal with Claude
 def extract_signal(message_text, channel_name):
     response = claude.messages.create(
         model="claude-opus-4-5",
         max_tokens=500,
         messages=[{
             "role": "user",
-            "content": f"""Extract trading signal from this message. 
+            "content": f"""Extract trading signal from this message.
 Channel: {channel_name}
-
 Message: {message_text}
 
-Respond in JSON only (null for missing fields):
-{{
-  "is_signal": true/false,
-  "asset": "XAUUSD/XAGUSD/BRENTOIL/BTCUSD/ETHUSD/etc",
-  "direction": "BUY/SELL",
-  "entry": number,
-  "stop_loss": number,
-  "tp1": number,
-  "tp2": number,
-  "tp3": number,
-  "tp4": number,
-  "tp5": number,
-  "confidence": "High/Medium/Low"
-}}"""
+Respond in JSON only (use null for missing fields):
+{{"is_signal": true, "asset": "XAUUSD", "direction": "BUY", "entry": 4700, "stop_loss": 4650, "tp1": 4750, "tp2": 4800, "tp3": null, "tp4": null, "tp5": null, "confidence": "High"}}"""
         }]
     )
     try:
         return json.loads(response.content[0].text)
-    except:
+    except Exception:
         return {"is_signal": False}
 
-# Save signal to Google Sheets
 def save_signal(signal, channel_name, message_text):
     try:
         sheet = get_sheets()
@@ -137,37 +114,111 @@ def save_signal(signal, channel_name, message_text):
         print(f"Error saving signal: {e}")
         return None
 
-# Main Telethon client
 async def main():
-    # User client (reads channels)
     user_client = TelegramClient('user_session', API_ID, API_HASH)
-    
-    # Bot client (sends messages to you)
     bot_client = TelegramClient('bot_session', API_ID, API_HASH)
     await bot_client.start(bot_token=BOT_TOKEN)
-    
     await user_client.start()
     print("Telethon started!")
 
     @user_client.on(events.NewMessage)
     async def handler(event):
         try:
-            # Only process channel messages
             if not event.is_channel:
                 return
-
             chat = await event.get_chat()
             username = f"@{chat.username}" if chat.username else str(chat.id)
             channel_name = chat.title
 
-            # Check if this is a known signal channel
             if not is_signal_channel(username):
-                # New channel — analyze history
                 messages = []
                 async for msg in user_client.iter_messages(chat, limit=50):
                     if msg.text:
                         messages.append(msg.text)
-                
                 analysis = analyze_channel_history(messages)
-                
                 if analysis['confidence'] >= 80:
+                    add_signal_channel(username, channel_name)
+                    await bot_client.send_message(
+                        PERSONAL_CHAT_ID,
+                        f"✅ New signal channel detected!\n{username} added automatically\nConfidence: {analysis['confidence']}%\nReason: {analysis['reason']}"
+                    )
+                elif analysis['confidence'] >= 40:
+                    await bot_client.send_message(
+                        PERSONAL_CHAT_ID,
+                        f"⚠️ Possible signal channel: {username}\nConfidence: {analysis['confidence']}%\nReason: {analysis['reason']}\n\nReply /add_{chat.id} to add or /skip_{chat.id} to ignore"
+                    )
+                    return
+                else:
+                    return
+
+            if not event.message.text:
+                return
+
+            signal = extract_signal(event.message.text, channel_name)
+            if not signal.get('is_signal'):
+                return
+
+            signal_id = save_signal(signal, channel_name, event.message.text)
+            if signal_id:
+                await bot_client.send_message(
+                    PERSONAL_CHAT_ID,
+                    f"📡 NEW SIGNAL\n\n"
+                    f"ID: {signal_id}\n"
+                    f"Asset: {signal.get('asset')}\n"
+                    f"Direction: {signal.get('direction')}\n"
+                    f"Entry: {signal.get('entry')}\n"
+                    f"SL: {signal.get('stop_loss')}\n"
+                    f"TP1: {signal.get('tp1')}\n"
+                    f"TP2: {signal.get('tp2')}\n"
+                    f"Confidence: {signal.get('confidence')}\n"
+                    f"Channel: {channel_name}\n\n"
+                    f"Track this signal?\n"
+                    f"/yes_{signal_id} or /no_{signal_id}"
+                )
+        except Exception as e:
+            print(f"Error processing message: {e}")
+
+    @bot_client.on(events.NewMessage(pattern=r'/yes_(.+)'))
+    async def yes_handler(event):
+        signal_id = event.pattern_match.group(1)
+        try:
+            sheet = get_sheets()
+            ws = sheet.worksheet('Signals')
+            cell = ws.find(signal_id)
+            if cell:
+                ws.update_cell(cell.row, 15, 'OPEN')
+                await event.reply(f"✅ Signal {signal_id} is now being tracked!")
+        except Exception as e:
+            await event.reply(f"Error: {e}")
+
+    @bot_client.on(events.NewMessage(pattern=r'/no_(.+)'))
+    async def no_handler(event):
+        signal_id = event.pattern_match.group(1)
+        try:
+            sheet = get_sheets()
+            ws = sheet.worksheet('Signals')
+            cell = ws.find(signal_id)
+            if cell:
+                ws.update_cell(cell.row, 15, 'IGNORED')
+                await event.reply(f"❌ Signal {signal_id} ignored!")
+        except Exception as e:
+            await event.reply(f"Error: {e}")
+
+    @bot_client.on(events.NewMessage(pattern=r'/add_(.+)'))
+    async def add_handler(event):
+        chat_id = event.pattern_match.group(1)
+        try:
+            chat = await user_client.get_entity(int(chat_id))
+            username = f"@{chat.username}" if chat.username else str(chat.id)
+            add_signal_channel(username, chat.title)
+            await event.reply(f"✅ {username} added as signal channel!")
+        except Exception as e:
+            await event.reply(f"Error: {e}")
+
+    await asyncio.gather(
+        user_client.run_until_disconnected(),
+        bot_client.run_until_disconnected()
+    )
+
+if __name__ == '__main__':
+    asyncio.run(main())
