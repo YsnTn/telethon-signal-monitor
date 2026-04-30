@@ -2,6 +2,7 @@ import os
 import asyncio
 import json
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession  # ← ADDED
 import anthropic
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -9,6 +10,7 @@ from datetime import datetime
 
 API_ID = int(os.environ.get('API_ID'))
 API_HASH = os.environ.get('API_HASH')
+SESSION_STRING = os.environ.get('SESSION_STRING')  # ← ADDED
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 PERSONAL_CHAT_ID = int(os.environ.get('PERSONAL_CHAT_ID'))
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
@@ -115,11 +117,18 @@ def save_signal(signal, channel_name, message_text):
         return None
 
 async def main():
-    user_client = TelegramClient('user_session', API_ID, API_HASH)
+    # ← CHANGED: StringSession instead of file-based 'user_session'
+    user_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     bot_client = TelegramClient('bot_session', API_ID, API_HASH)
+
     await bot_client.start(bot_token=BOT_TOKEN)
-    await user_client.start()
-    print("Telethon started!")
+    await user_client.connect()  # ← CHANGED: connect() not start() — no interactive prompt
+
+    if not await user_client.is_user_authorized():
+        print("ERROR: SESSION_STRING is invalid or expired. Re-generate it.")
+        return
+
+    print("Telethon started! User client authorized.")
 
     @user_client.on(events.NewMessage)
     async def handler(event):
