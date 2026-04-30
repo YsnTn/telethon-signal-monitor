@@ -28,6 +28,7 @@ GOOGLE_CREDENTIALS = os.environ.get('GOOGLE_CREDENTIALS', '')
 SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID', '')
 ACCOUNT_SIZE = 500
 RISK_PERCENT = 0.02
+pending_channels = set()
 
 print("All env vars loaded.")
 
@@ -291,22 +292,28 @@ async def main():
             channel_name = chat.title
 
             if not is_signal_channel(username):
-                messages = []
-                async for msg in user_client.iter_messages(chat, limit=50):
-                    if msg.text:
-                        messages.append(msg.text)
-                analysis = analyze_channel_history(messages)
-                if analysis['confidence'] >= 80:
-                    add_signal_channel(username, channel_name)
-                    await bot_client.send_message(
-                        PERSONAL_CHAT_ID,
-                        "New signal channel detected!\n" + username + " added automatically\nConfidence: " + str(analysis['confidence']) + "%\nReason: " + str(analysis['reason'])
-                    )
-                elif analysis['confidence'] >= 40:
-                    await bot_client.send_message(
-                        PERSONAL_CHAT_ID,
-                        "Possible signal channel: " + username + "\nConfidence: " + str(analysis['confidence']) + "%\nReason: " + str(analysis['reason'])
-                    )
+                if username in pending_channels:
+                    return
+                pending_channels.add(username)
+                try:
+                    messages = []
+                    async for msg in user_client.iter_messages(chat, limit=50):
+                        if msg.text:
+                            messages.append(msg.text)
+                    analysis = analyze_channel_history(messages)
+                    if analysis['confidence'] >= 80:
+                        add_signal_channel(username, channel_name)
+                        await bot_client.send_message(
+                            PERSONAL_CHAT_ID,
+                            "New signal channel detected!\n" + username + " added automatically\nConfidence: " + str(analysis['confidence']) + "%\nReason: " + str(analysis['reason'])
+                        )
+                    elif analysis['confidence'] >= 40:
+                        await bot_client.send_message(
+                            PERSONAL_CHAT_ID,
+                            "Possible signal channel: " + username + "\nConfidence: " + str(analysis['confidence']) + "%\nReason: " + str(analysis['reason'])
+                        )
+                finally:
+                    pending_channels.discard(username)
                 return
 
             if not event.message.text:
