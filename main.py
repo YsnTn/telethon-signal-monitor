@@ -130,20 +130,43 @@ def is_fake_signal(signal, channel_name):
         return True, "Poor RR ratio (" + str(round(tp_dist/sl_dist, 2)) + ":1)"
     return False, None
 
+def parse_claude_json(text):
+    try:
+        text = text.strip()
+        if not text:
+            return None
+        if "```" in text:
+            parts = text.split("```")
+            for part in parts:
+                part = part.strip()
+                if part.startswith("json"):
+                    part = part[4:].strip()
+                try:
+                    return json.loads(part)
+                except:
+                    continue
+        return json.loads(text)
+    except Exception as e:
+        print("JSON parse error: " + str(e) + " | text: " + str(text[:100]))
+        return None
+
 def validate_signal_with_ai(message_text, signal, channel_name):
     try:
         response = claude.messages.create(
-            model="claude-opus-4-5",
+            model="claude-haiku-4-5-20251001",
             max_tokens=200,
             messages=[{
                 "role": "user",
-                "content": "Score this trading signal quality from 1-10.\nChannel: " + channel_name + "\nMessage: " + message_text + "\nExtracted: " + json.dumps(signal) + "\n\nCriteria: clear entry, reasonable SL/TP, valid asset, RR ratio >= 1:1, not vague.\nRespond in JSON only: {\"score\": 7, \"reason\": \"brief reason\"}"
+                "content": "Score this trading signal quality from 1-10.\nChannel: " + channel_name + "\nMessage: " + message_text + "\nExtracted: " + json.dumps(signal) + "\n\nCriteria: clear entry, reasonable SL/TP, valid asset, RR ratio >= 1:1, not vague.\nRespond in JSON only, no markdown: {\"score\": 7, \"reason\": \"brief reason\"}"
             }]
         )
-        return json.loads(response.content[0].text)
+        result = parse_claude_json(response.content[0].text)
+        if result:
+            return result
+        return {"score": 5, "reason": "Parse error"}
     except Exception as e:
         print("AI validator error: " + str(e))
-        return {"score": 5, "reason": "Parse error"}
+        return {"score": 5, "reason": "Error"}
 
 def is_signal_channel(username):
     try:
@@ -171,29 +194,35 @@ def analyze_channel_history(messages):
     try:
         text = '\n'.join(messages[:50])
         response = claude.messages.create(
-            model="claude-opus-4-5",
+            model="claude-haiku-4-5-20251001",
             max_tokens=500,
             messages=[{
                 "role": "user",
-                "content": "Analyze these Telegram channel messages and determine if this is a trading signal channel.\nLook for: entry prices, stop loss, take profit, asset names (XAUUSD, BTC, etc), BUY/SELL directions.\n\nMessages:\n" + text + "\n\nRespond in JSON only:\n{\"is_signal_channel\": true, \"confidence\": 85, \"reason\": \"brief reason\"}"
+                "content": "Analyze these Telegram channel messages and determine if this is a trading signal channel.\nLook for: entry prices, stop loss, take profit, asset names (XAUUSD, BTC, etc), BUY/SELL directions.\n\nMessages:\n" + text + "\n\nRespond in JSON only, no markdown: {\"is_signal_channel\": true, \"confidence\": 85, \"reason\": \"brief reason\"}"
             }]
         )
-        return json.loads(response.content[0].text)
+        result = parse_claude_json(response.content[0].text)
+        if result:
+            return result
+        return {"is_signal_channel": False, "confidence": 0, "reason": "Parse error"}
     except Exception as e:
         print("analyze_channel_history error: " + str(e))
-        return {"is_signal_channel": False, "confidence": 0, "reason": "Parse error"}
+        return {"is_signal_channel": False, "confidence": 0, "reason": "Error"}
 
 def extract_signal(message_text, channel_name):
     try:
         response = claude.messages.create(
-            model="claude-opus-4-5",
+            model="claude-haiku-4-5-20251001",
             max_tokens=500,
             messages=[{
                 "role": "user",
-                "content": "Extract trading signal from this message.\nChannel: " + channel_name + "\nMessage: " + message_text + "\n\nRespond in JSON only (use null for missing fields):\n{\"is_signal\": true, \"asset\": \"XAUUSD\", \"direction\": \"BUY\", \"entry\": 4700, \"stop_loss\": 4650, \"tp1\": 4750, \"tp2\": 4800, \"tp3\": null, \"tp4\": null, \"tp5\": null, \"confidence\": \"High\"}"
+                "content": "Extract trading signal from this message.\nChannel: " + channel_name + "\nMessage: " + message_text + "\n\nRespond in JSON only, no markdown (use null for missing fields):\n{\"is_signal\": true, \"asset\": \"XAUUSD\", \"direction\": \"BUY\", \"entry\": 4700, \"stop_loss\": 4650, \"tp1\": 4750, \"tp2\": 4800, \"tp3\": null, \"tp4\": null, \"tp5\": null, \"confidence\": \"High\"}"
             }]
         )
-        return json.loads(response.content[0].text)
+        result = parse_claude_json(response.content[0].text)
+        if result:
+            return result
+        return {"is_signal": False}
     except Exception as e:
         print("extract_signal error: " + str(e))
         return {"is_signal": False}
