@@ -73,7 +73,7 @@ def get_signal_channels():
         return signal_channels_cache
     except Exception as e:
         print("Error refreshing signal channels cache: " + str(e))
-        signal_channels_cache_time = now + 60  # back off 1 min on error
+        signal_channels_cache_time = now + 60
         return signal_channels_cache
 
 def is_signal_channel(username):
@@ -401,4 +401,13 @@ async def main():
     )
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    while True:
+        try:
+            asyncio.run(main())
+            break
+        except Exception as e:
+            if 'AuthKeyDuplicated' in str(e):
+                print("AuthKeyDuplicated - waiting 30s for old instance to die...")
+                time.sleep(30)
+            else:
+                raise
