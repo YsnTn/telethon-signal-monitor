@@ -7,8 +7,8 @@ from telethon.sessions import StringSession
 import anthropic
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
-from pytz import timezone
+from datetime import datetime, timezone
+from pytz import timezone as pytz_timezone
 
 print("Starting up...")
 print("API_ID set: " + str(bool(os.environ.get('API_ID'))))
@@ -17,7 +17,7 @@ print("BOT_TOKEN set: " + str(bool(os.environ.get('BOT_TOKEN'))))
 print("GOOGLE_CREDENTIALS set: " + str(bool(os.environ.get('GOOGLE_CREDENTIALS'))))
 print("SPREADSHEET_ID set: " + str(bool(os.environ.get('SPREADSHEET_ID'))))
 
-BAKU = timezone('Asia/Baku')
+BAKU = pytz_timezone('Asia/Baku')
 
 API_ID = int(os.environ.get('API_ID', 0))
 API_HASH = os.environ.get('API_HASH', '')
@@ -29,7 +29,10 @@ GOOGLE_CREDENTIALS = os.environ.get('GOOGLE_CREDENTIALS', '')
 SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID', '')
 ACCOUNT_SIZE = 500
 RISK_PERCENT = 0.02
-CACHE_TTL = 900  # 15 minutes
+CACHE_TTL = 900
+TRIAL_DAYS = 7
+TRIAL_MIN_SIGNALS = 5
+TRIAL_MIN_WIN_RATE = 50
 pending_channels = set()
 
 signal_channels_cache = {}
@@ -66,7 +69,10 @@ def get_signal_channels():
         for row in records:
             username = str(row.get('Channel Username', '')).lower().strip()
             if username:
-                new_cache[username] = str(row.get('Active', '')) == 'TRUE'
+                new_cache[username] = {
+                    'active': str(row.get('Active', '')) == 'TRUE',
+                    'status': str(row.get('Status', 'PENDING')).upper().strip()
+                }
         signal_channels_cache = new_cache
         signal_channels_cache_time = now
         print("SignalChannels cache refreshed. Count: " + str(len(signal_channels_cache)))
@@ -78,11 +84,96 @@ def get_signal_channels():
 
 def is_signal_channel(username):
     channels = get_signal_channels()
-    return channels.get(str(username).lower().strip(), False)
+    entry = channels.get(str(username).lower().strip())
+    if not entry:
+        return False
+    return entry['active'] and entry['status'] == 'ACTIVE'
+
+def is_known_channel(username):
+    channels = get_signal_channels()
+    return str(username).lower().strip() in channels
+
+def get_channel_status(username):
+    channels = get_signal_channels()
+    entry = channels.get(str(username).lower().strip())
+    if not entry:
+        return None
+    return entry['status']
 
 def invalidate_channel_cache():
     global signal_channels_cache_time
     signal_channels_cache_time = 0
+
+def add_pending_channel(username, name):
+    try:
+        sheet = get_sheets()
+        ws = sheet.worksheet('SignalChannels')
+        ws.append_row([
+            str(username),
+            str(name),
+            'FALSE',
+            now_baku(),
+            'PENDING',
+            now_baku(),
+            0, 0, 0
+        ])
+        invalidate_channel_cache()
+        print("Added " + str(username) + " as PENDING")
+    except Exception as e:
+        print("Error adding pending channel: " + str(e))
+
+def update_trial_stats(username, is_tp):
+    try:
+        sheet = get_sheets()
+        ws = sheet.worksheet('SignalChannels')
+        records = ws.get_all_records()
+        for i, row in enumerate(records):
+            if str(row.get('Channel Username', '')).lower().strip() == str(username).lower().strip():
+                row_num = i + 2
+                trial_signals = int(row.get('Trial Signals', 0)) + 1
+                trial_tp = int(row.get('Trial TP Hits', 0)) + (1 if is_tp else 0)
+                trial_sl = int(row.get('Trial SL Hits', 0)) + (0 if is_tp else 1)
+                trial_start = str(row.get('Trial Start', now_baku()))
+
+                # Check if ready to graduate
+                try:
+                    start_dt = datetime.strptime(trial_start[:10], '%Y-%m-%d')
+                    days_elapsed = (datetime.now() - start_dt).days
+                except:
+                    days_elapsed = 0
+
+                win_rate = round((trial_tp / trial_signals) * 100, 1) if trial_signals > 0 else 0
+
+                ws.update('G' + str(row_num) + ':I' + str(row_num), [[trial_signals, trial_tp, trial_sl]])
+
+                # Graduate if enough signals and days
+                if trial_signals >= TRIAL_MIN_SIGNALS and days_elapsed >= TRIAL_DAYS:
+                    return {
+                        'ready': True,
+                        'win_rate': win_rate,
+                        'trial_signals': trial_signals,
+                        'channel_name': str(row.get('Channel Name', username)),
+                        'row_num': row_num
+                    }
+                return {'ready': False, 'win_rate': win_rate, 'trial_signals': trial_signals}
+        return None
+    except Exception as e:
+        print("Error updating trial stats: " + str(e))
+        return None
+
+def graduate_channel(username, row_num, approve):
+    try:
+        sheet = get_sheets()
+        ws = sheet.worksheet('SignalChannels')
+        if approve:
+            ws.update('C' + str(row_num), [['TRUE']])
+            ws.update('E' + str(row_num), [['ACTIVE']])
+        else:
+            ws.update('C' + str(row_num), [['FALSE']])
+            ws.update('E' + str(row_num), [['BLOCKED']])
+        invalidate_channel_cache()
+    except Exception as e:
+        print("Error graduating channel: " + str(e))
 
 def get_trust_score(channel_name):
     try:
@@ -205,25 +296,19 @@ def validate_signal_with_ai(message_text, signal, channel_name):
         print("AI validator error: " + str(e))
         return {"score": 5, "reason": "Error"}
 
-def add_signal_channel(username, name):
-    try:
-        sheet = get_sheets()
-        ws = sheet.worksheet('SignalChannels')
-        ws.append_row([str(username), str(name), 'TRUE', now_baku()])
-        invalidate_channel_cache()
-        print("Added " + str(username) + " to SignalChannels")
-    except Exception as e:
-        print("Error adding channel: " + str(e))
-
 def analyze_channel_history(messages):
     try:
+        if len(messages) < 3:
+            print("Too few messages to analyze channel")
+            return {"is_signal_channel": False, "confidence": 0, "reason": "Too few messages"}
+
         text = '\n'.join(messages[:50])
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=500,
             messages=[{
                 "role": "user",
-                "content": "Analyze these Telegram channel messages and determine if this is a trading signal channel.\nLook for: entry prices, stop loss, take profit, asset names (XAUUSD, BTC, etc), BUY/SELL directions.\n\nMessages:\n" + text + "\n\nRespond in JSON only, no markdown: {\"is_signal_channel\": true, \"confidence\": 85, \"reason\": \"brief reason\"}"
+                "content": "Analyze these Telegram channel messages. Is this a TRADING SIGNAL channel?\n\nA trading signal channel MUST have ALL of these:\n- Specific BUY or SELL direction\n- Specific entry price\n- Specific Stop Loss price\n- At least one Take Profit price\n- At least 3 such signals visible in the messages\n\nNEWS channels, price update channels, analysis channels, and educational channels are NOT signal channels even if they mention prices or assets.\n\nMessages:\n" + text + "\n\nRespond in JSON only, no markdown: {\"is_signal_channel\": true, \"confidence\": 85, \"reason\": \"brief reason\"}\n\nBe strict. If fewer than 3 complete signals with entry+SL+TP are visible, confidence must be below 40."
             }]
         )
         result = parse_claude_json(response.content[0].text)
@@ -252,7 +337,7 @@ def extract_signal(message_text, channel_name):
         print("extract_signal error: " + str(e))
         return {"is_signal": False}
 
-def save_signal(signal, channel_name, message_text):
+def save_signal(signal, channel_name, message_text, status='OPEN'):
     try:
         sheet = get_sheets()
         ws = sheet.worksheet('Signals')
@@ -272,7 +357,7 @@ def save_signal(signal, channel_name, message_text):
             signal.get('tp5', ''),
             signal.get('confidence', ''),
             str(message_text)[:200],
-            'OPEN'
+            status
         ])
         return signal_id
     except Exception as e:
@@ -316,7 +401,8 @@ async def main():
             username = "@" + chat.username if chat.username else str(chat.id)
             channel_name = chat.title
 
-            if not is_signal_channel(username):
+            # Unknown channel — analyze it
+            if not is_known_channel(username):
                 if username in pending_channels:
                     return
                 pending_channels.add(username)
@@ -327,18 +413,55 @@ async def main():
                             messages.append(msg.text)
                     analysis = analyze_channel_history(messages)
                     if analysis['confidence'] >= 80:
-                        add_signal_channel(username, channel_name)
+                        add_pending_channel(username, channel_name)
                         await bot_client.send_message(
                             PERSONAL_CHAT_ID,
-                            "New signal channel detected!\n" + str(username) + " added automatically\nConfidence: " + str(analysis['confidence']) + "%\nReason: " + str(analysis['reason'])
+                            "TRIAL STARTED\n\n"
+                            "Channel: " + str(username) + "\n"
+                            "Name: " + str(channel_name) + "\n"
+                            "Confidence: " + str(analysis['confidence']) + "%\n"
+                            "Reason: " + str(analysis['reason']) + "\n\n"
+                            "Monitoring for " + str(TRIAL_DAYS) + " days / " + str(TRIAL_MIN_SIGNALS) + "+ signals.\n"
+                            "Will notify you when trial is complete."
                         )
                     elif analysis['confidence'] >= 40:
                         await bot_client.send_message(
                             PERSONAL_CHAT_ID,
-                            "Possible signal channel: " + str(username) + "\nConfidence: " + str(analysis['confidence']) + "%\nReason: " + str(analysis['reason'])
+                            "Possible signal channel: " + str(username) + "\n"
+                            "Confidence: " + str(analysis['confidence']) + "%\n"
+                            "Reason: " + str(analysis['reason']) + "\n"
+                            "(Below threshold, not added)"
                         )
                 finally:
                     pending_channels.discard(username)
+                return
+
+            channel_status = get_channel_status(username)
+
+            # PENDING channel — collect signals silently for trial
+            if channel_status == 'PENDING':
+                if not event.message.text:
+                    return
+                signal = extract_signal(event.message.text, channel_name)
+                if not signal.get('is_signal'):
+                    return
+                is_fake, _ = is_fake_signal(signal, channel_name)
+                if is_fake:
+                    return
+                validation = validate_signal_with_ai(event.message.text, signal, channel_name)
+                if validation['score'] < 6:
+                    return
+                # Save silently with TRIAL status
+                save_signal(signal, channel_name, event.message.text, status='TRIAL')
+                print("Trial signal saved from " + str(channel_name))
+                return
+
+            # BLOCKED channel — ignore
+            if channel_status == 'BLOCKED':
+                return
+
+            # ACTIVE channel — full processing
+            if not is_signal_channel(username):
                 return
 
             if not event.message.text:
@@ -375,7 +498,7 @@ async def main():
             lot_size = calculate_lot_size(signal.get('asset'), entry, sl) if entry and sl else None
             lot_text = str(lot_size) + " lots" if lot_size else "N/A"
 
-            signal_id = save_signal(signal, channel_name, event.message.text)
+            signal_id = save_signal(signal, channel_name, event.message.text, status='OPEN')
             if signal_id:
                 msg = (
                     "NEW SIGNAL\n\n"
