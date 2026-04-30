@@ -2,12 +2,13 @@ import os
 import asyncio
 import json
 import time
+from aiohttp import web
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 import anthropic
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime, timezone
+from datetime import datetime
 from pytz import timezone as pytz_timezone
 
 print("Starting up...")
@@ -41,6 +42,9 @@ signal_channels_cache_time = 0
 print("All env vars loaded.")
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# Global bot client reference for webhook use
+bot_client_ref = None
 
 def now_baku():
     return datetime.now(BAKU).strftime('%Y-%m-%d %H:%M:%S')
@@ -122,20 +126,27 @@ def add_pending_channel(username, name):
     except Exception as e:
         print("Error adding pending channel: " + str(e))
 
-def update_trial_stats(username, is_tp):
+def update_trial_stats(channel_name, hit_type):
     try:
         sheet = get_sheets()
         ws = sheet.worksheet('SignalChannels')
         records = ws.get_all_records()
+        is_tp = hit_type.startswith('TP')
+
         for i, row in enumerate(records):
-            if str(row.get('Channel Username', '')).lower().strip() == str(username).lower().strip():
+            row_channel = str(row.get('Channel Name', '')).lower().strip()
+            row_username = str(row.get('Channel Username', '')).lower().strip()
+            if row_channel == str(channel_name).lower().strip() or row_username == str(channel_name).lower().strip():
                 row_num = i + 2
+                status = str(row.get('Status', '')).upper().strip()
+                if status != 'PENDING':
+                    return None
+
                 trial_signals = int(row.get('Trial Signals', 0)) + 1
                 trial_tp = int(row.get('Trial TP Hits', 0)) + (1 if is_tp else 0)
                 trial_sl = int(row.get('Trial SL Hits', 0)) + (0 if is_tp else 1)
                 trial_start = str(row.get('Trial Start', now_baku()))
 
-                # Check if ready to graduate
                 try:
                     start_dt = datetime.strptime(trial_start[:10], '%Y-%m-%d')
                     days_elapsed = (datetime.now() - start_dt).days
@@ -146,34 +157,38 @@ def update_trial_stats(username, is_tp):
 
                 ws.update('G' + str(row_num) + ':I' + str(row_num), [[trial_signals, trial_tp, trial_sl]])
 
-                # Graduate if enough signals and days
+                print("Trial updated for " + str(channel_name) + ": " + str(trial_signals) + " signals, " + str(win_rate) + "% win rate, " + str(days_elapsed) + " days")
+
                 if trial_signals >= TRIAL_MIN_SIGNALS and days_elapsed >= TRIAL_DAYS:
+                    approve = win_rate >= TRIAL_MIN_WIN_RATE
+                    if approve:
+                        ws.update('C' + str(row_num), [['TRUE']])
+                        ws.update('E' + str(row_num), [['ACTIVE']])
+                    else:
+                        ws.update('C' + str(row_num), [['FALSE']])
+                        ws.update('E' + str(row_num), [['BLOCKED']])
+                    invalidate_channel_cache()
                     return {
-                        'ready': True,
+                        'graduated': True,
+                        'approved': approve,
                         'win_rate': win_rate,
                         'trial_signals': trial_signals,
-                        'channel_name': str(row.get('Channel Name', username)),
-                        'row_num': row_num
+                        'channel_name': str(row.get('Channel Name', channel_name)),
+                        'username': str(row.get('Channel Username', channel_name))
                     }
-                return {'ready': False, 'win_rate': win_rate, 'trial_signals': trial_signals}
+
+                return {
+                    'graduated': False,
+                    'win_rate': win_rate,
+                    'trial_signals': trial_signals,
+                    'days_elapsed': days_elapsed
+                }
+
+        print("Channel not found in SignalChannels: " + str(channel_name))
         return None
     except Exception as e:
         print("Error updating trial stats: " + str(e))
         return None
-
-def graduate_channel(username, row_num, approve):
-    try:
-        sheet = get_sheets()
-        ws = sheet.worksheet('SignalChannels')
-        if approve:
-            ws.update('C' + str(row_num), [['TRUE']])
-            ws.update('E' + str(row_num), [['ACTIVE']])
-        else:
-            ws.update('C' + str(row_num), [['FALSE']])
-            ws.update('E' + str(row_num), [['BLOCKED']])
-        invalidate_channel_cache()
-    except Exception as e:
-        print("Error graduating channel: " + str(e))
 
 def get_trust_score(channel_name):
     try:
@@ -364,7 +379,69 @@ def save_signal(signal, channel_name, message_text, status='OPEN'):
         print("Error saving signal: " + str(e))
         return None
 
+async def handle_trial_update(request):
+    try:
+        data = await request.json()
+        channel = data.get('channel', '')
+        hit_type = data.get('hitType', '')
+
+        if not channel or not hit_type:
+            return web.json_response({'error': 'missing channel or hitType'}, status=400)
+
+        print("Webhook: trial update for " + str(channel) + " hit=" + str(hit_type))
+
+        result = update_trial_stats(channel, hit_type)
+
+        if result and result.get('graduated'):
+            approved = result.get('approved')
+            win_rate = result.get('win_rate')
+            trial_signals = result.get('trial_signals')
+            channel_name = result.get('channel_name', channel)
+            username = result.get('username', channel)
+
+            if approved:
+                msg = (
+                    "CHANNEL APPROVED\n\n"
+                    "Channel: " + str(username) + "\n"
+                    "Name: " + str(channel_name) + "\n"
+                    "Win Rate: " + str(win_rate) + "%\n"
+                    "Trial Signals: " + str(trial_signals) + "\n\n"
+                    "Now receiving live signal alerts from this channel."
+                )
+            else:
+                msg = (
+                    "CHANNEL BLOCKED\n\n"
+                    "Channel: " + str(username) + "\n"
+                    "Name: " + str(channel_name) + "\n"
+                    "Win Rate: " + str(win_rate) + "% (below 50%)\n"
+                    "Trial Signals: " + str(trial_signals) + "\n\n"
+                    "Channel did not meet quality threshold. Blocked."
+                )
+
+            if bot_client_ref:
+                asyncio.create_task(bot_client_ref.send_message(PERSONAL_CHAT_ID, msg))
+
+        return web.json_response({'ok': True, 'result': result})
+
+    except Exception as e:
+        print("Webhook error: " + str(e))
+        return web.json_response({'error': str(e)}, status=500)
+
+async def handle_health(request):
+    return web.json_response({'status': 'ok', 'time': now_baku()})
+
+async def start_webhook_server():
+    app = web.Application()
+    app.router.add_post('/trial-update', handle_trial_update)
+    app.router.add_get('/health', handle_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    await site.start()
+    print("Webhook server started on port 8080")
+
 async def main():
+    global bot_client_ref
     print("Entering main()...")
 
     user_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
@@ -372,6 +449,7 @@ async def main():
 
     print("Starting bot client...")
     await bot_client.start(bot_token=BOT_TOKEN)
+    bot_client_ref = bot_client
     print("Bot client started.")
 
     print("Connecting user client...")
@@ -392,6 +470,8 @@ async def main():
     except Exception as e:
         print("STARTUP Google Sheets ERROR: " + str(e))
 
+    await start_webhook_server()
+
     @user_client.on(events.NewMessage)
     async def handler(event):
         try:
@@ -401,7 +481,6 @@ async def main():
             username = "@" + chat.username if chat.username else str(chat.id)
             channel_name = chat.title
 
-            # Unknown channel — analyze it
             if not is_known_channel(username):
                 if username in pending_channels:
                     return
@@ -438,7 +517,6 @@ async def main():
 
             channel_status = get_channel_status(username)
 
-            # PENDING channel — collect signals silently for trial
             if channel_status == 'PENDING':
                 if not event.message.text:
                     return
@@ -451,16 +529,13 @@ async def main():
                 validation = validate_signal_with_ai(event.message.text, signal, channel_name)
                 if validation['score'] < 6:
                     return
-                # Save silently with TRIAL status
                 save_signal(signal, channel_name, event.message.text, status='TRIAL')
                 print("Trial signal saved from " + str(channel_name))
                 return
 
-            # BLOCKED channel — ignore
             if channel_status == 'BLOCKED':
                 return
 
-            # ACTIVE channel — full processing
             if not is_signal_channel(username):
                 return
 
