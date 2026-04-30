@@ -29,12 +29,11 @@ GOOGLE_CREDENTIALS = os.environ.get('GOOGLE_CREDENTIALS', '')
 SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID', '')
 ACCOUNT_SIZE = 500
 RISK_PERCENT = 0.02
+CACHE_TTL = 900  # 15 minutes
 pending_channels = set()
 
-# Cache for SignalChannels
 signal_channels_cache = {}
 signal_channels_cache_time = 0
-CACHE_TTL = 300  # 5 minutes
 
 print("All env vars loaded.")
 
@@ -63,20 +62,23 @@ def get_signal_channels():
         sheet = get_sheets()
         ws = sheet.worksheet('SignalChannels')
         records = ws.get_all_records()
-        signal_channels_cache = {
-            row.get('Channel Username', '').lower(): row.get('Active', '') == 'TRUE'
-            for row in records
-        }
+        new_cache = {}
+        for row in records:
+            username = str(row.get('Channel Username', '')).lower().strip()
+            if username:
+                new_cache[username] = str(row.get('Active', '')) == 'TRUE'
+        signal_channels_cache = new_cache
         signal_channels_cache_time = now
         print("SignalChannels cache refreshed. Count: " + str(len(signal_channels_cache)))
         return signal_channels_cache
     except Exception as e:
         print("Error refreshing signal channels cache: " + str(e))
+        signal_channels_cache_time = now + 60  # back off 1 min on error
         return signal_channels_cache
 
 def is_signal_channel(username):
     channels = get_signal_channels()
-    return channels.get(username.lower(), False)
+    return channels.get(str(username).lower().strip(), False)
 
 def invalidate_channel_cache():
     global signal_channels_cache_time
@@ -88,7 +90,7 @@ def get_trust_score(channel_name):
         ws = sheet.worksheet('ChannelScores')
         records = ws.get_all_records()
         for row in records:
-            if row.get('Channel Name', '').lower() == channel_name.lower():
+            if str(row.get('Channel Name', '')).lower() == str(channel_name).lower():
                 return {
                     'trust_score': row.get('Trust Score', 0),
                     'total_signals': row.get('Total Signals', 0),
@@ -107,7 +109,7 @@ def update_channel_score(channel_name, hit_type):
         is_tp = hit_type.startswith('TP')
 
         for i, row in enumerate(records):
-            if row.get('Channel Name', '').lower() == channel_name.lower():
+            if str(row.get('Channel Name', '')).lower() == str(channel_name).lower():
                 row_num = i + 2
                 total = int(row.get('Total Signals', 0)) + 1
                 tp_hits = int(row.get('TP Hits', 0)) + (1 if is_tp else 0)
@@ -192,7 +194,7 @@ def validate_signal_with_ai(message_text, signal, channel_name):
             max_tokens=200,
             messages=[{
                 "role": "user",
-                "content": "Score this trading signal quality from 1-10.\nChannel: " + channel_name + "\nMessage: " + message_text + "\nExtracted: " + json.dumps(signal) + "\n\nCriteria: clear entry, reasonable SL/TP, valid asset, RR ratio >= 1:1, not vague.\nRespond in JSON only, no markdown: {\"score\": 7, \"reason\": \"brief reason\"}"
+                "content": "Score this trading signal quality from 1-10.\nChannel: " + str(channel_name) + "\nMessage: " + str(message_text) + "\nExtracted: " + json.dumps(signal) + "\n\nCriteria: clear entry, reasonable SL/TP, valid asset, RR ratio >= 1:1, not vague.\nRespond in JSON only, no markdown: {\"score\": 7, \"reason\": \"brief reason\"}"
             }]
         )
         result = parse_claude_json(response.content[0].text)
@@ -207,9 +209,9 @@ def add_signal_channel(username, name):
     try:
         sheet = get_sheets()
         ws = sheet.worksheet('SignalChannels')
-        ws.append_row([username, name, 'TRUE', now_baku()])
+        ws.append_row([str(username), str(name), 'TRUE', now_baku()])
         invalidate_channel_cache()
-        print("Added " + username + " to SignalChannels")
+        print("Added " + str(username) + " to SignalChannels")
     except Exception as e:
         print("Error adding channel: " + str(e))
 
@@ -239,7 +241,7 @@ def extract_signal(message_text, channel_name):
             max_tokens=500,
             messages=[{
                 "role": "user",
-                "content": "Extract trading signal from this message.\nChannel: " + channel_name + "\nMessage: " + message_text + "\n\nRespond in JSON only, no markdown (use null for missing fields):\n{\"is_signal\": true, \"asset\": \"XAUUSD\", \"direction\": \"BUY\", \"entry\": 4700, \"stop_loss\": 4650, \"tp1\": 4750, \"tp2\": 4800, \"tp3\": null, \"tp4\": null, \"tp5\": null, \"confidence\": \"High\"}"
+                "content": "Extract trading signal from this message.\nChannel: " + str(channel_name) + "\nMessage: " + str(message_text) + "\n\nRespond in JSON only, no markdown (use null for missing fields):\n{\"is_signal\": true, \"asset\": \"XAUUSD\", \"direction\": \"BUY\", \"entry\": 4700, \"stop_loss\": 4650, \"tp1\": 4750, \"tp2\": 4800, \"tp3\": null, \"tp4\": null, \"tp5\": null, \"confidence\": \"High\"}"
             }]
         )
         result = parse_claude_json(response.content[0].text)
@@ -254,7 +256,7 @@ def save_signal(signal, channel_name, message_text):
     try:
         sheet = get_sheets()
         ws = sheet.worksheet('Signals')
-        signal_id = signal['asset'] + '_' + datetime.now(BAKU).strftime('%Y%m%d%H%M%S')
+        signal_id = str(signal['asset']) + '_' + datetime.now(BAKU).strftime('%Y%m%d%H%M%S')
         ws.append_row([
             signal_id,
             now_baku(),
@@ -269,7 +271,7 @@ def save_signal(signal, channel_name, message_text):
             signal.get('tp4', ''),
             signal.get('tp5', ''),
             signal.get('confidence', ''),
-            message_text[:200],
+            str(message_text)[:200],
             'OPEN'
         ])
         return signal_id
@@ -328,12 +330,12 @@ async def main():
                         add_signal_channel(username, channel_name)
                         await bot_client.send_message(
                             PERSONAL_CHAT_ID,
-                            "New signal channel detected!\n" + username + " added automatically\nConfidence: " + str(analysis['confidence']) + "%\nReason: " + str(analysis['reason'])
+                            "New signal channel detected!\n" + str(username) + " added automatically\nConfidence: " + str(analysis['confidence']) + "%\nReason: " + str(analysis['reason'])
                         )
                     elif analysis['confidence'] >= 40:
                         await bot_client.send_message(
                             PERSONAL_CHAT_ID,
-                            "Possible signal channel: " + username + "\nConfidence: " + str(analysis['confidence']) + "%\nReason: " + str(analysis['reason'])
+                            "Possible signal channel: " + str(username) + "\nConfidence: " + str(analysis['confidence']) + "%\nReason: " + str(analysis['reason'])
                         )
                 finally:
                     pending_channels.discard(username)
@@ -348,7 +350,7 @@ async def main():
 
             is_fake, fake_reason = is_fake_signal(signal, channel_name)
             if is_fake:
-                print("Fake signal dropped from " + channel_name + ": " + str(fake_reason))
+                print("Fake signal dropped from " + str(channel_name) + ": " + str(fake_reason))
                 return
 
             validation = validate_signal_with_ai(event.message.text, signal, channel_name)
@@ -377,7 +379,7 @@ async def main():
             if signal_id:
                 msg = (
                     "NEW SIGNAL\n\n"
-                    "ID: " + signal_id + "\n"
+                    "ID: " + str(signal_id) + "\n"
                     "Asset: " + str(signal.get('asset')) + "\n"
                     "Direction: " + str(signal.get('direction')) + "\n"
                     "Entry: " + str(entry) + "\n"
@@ -387,7 +389,7 @@ async def main():
                     "AI Score: " + str(validation['score']) + "/10\n"
                     "Lot Size: " + lot_text + " (2% risk / $10)\n"
                     "Channel Trust: " + trust_label + " (" + str(trust_score) + "% / " + str(total_signals) + " signals)\n"
-                    "Channel: " + channel_name
+                    "Channel: " + str(channel_name)
                 )
                 await bot_client.send_message(PERSONAL_CHAT_ID, msg)
         except Exception as e:
