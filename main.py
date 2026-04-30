@@ -1,6 +1,7 @@
 import os
 import asyncio
 import json
+import time
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 import anthropic
@@ -30,6 +31,11 @@ ACCOUNT_SIZE = 500
 RISK_PERCENT = 0.02
 pending_channels = set()
 
+# Cache for SignalChannels
+signal_channels_cache = {}
+signal_channels_cache_time = 0
+CACHE_TTL = 300  # 5 minutes
+
 print("All env vars loaded.")
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -47,6 +53,34 @@ def get_sheets():
     except Exception as e:
         print("get_sheets ERROR: " + str(type(e).__name__) + ": " + str(e))
         raise
+
+def get_signal_channels():
+    global signal_channels_cache, signal_channels_cache_time
+    now = time.time()
+    if now - signal_channels_cache_time < CACHE_TTL and signal_channels_cache:
+        return signal_channels_cache
+    try:
+        sheet = get_sheets()
+        ws = sheet.worksheet('SignalChannels')
+        records = ws.get_all_records()
+        signal_channels_cache = {
+            row.get('Channel Username', '').lower(): row.get('Active', '') == 'TRUE'
+            for row in records
+        }
+        signal_channels_cache_time = now
+        print("SignalChannels cache refreshed. Count: " + str(len(signal_channels_cache)))
+        return signal_channels_cache
+    except Exception as e:
+        print("Error refreshing signal channels cache: " + str(e))
+        return signal_channels_cache
+
+def is_signal_channel(username):
+    channels = get_signal_channels()
+    return channels.get(username.lower(), False)
+
+def invalidate_channel_cache():
+    global signal_channels_cache_time
+    signal_channels_cache_time = 0
 
 def get_trust_score(channel_name):
     try:
@@ -169,24 +203,12 @@ def validate_signal_with_ai(message_text, signal, channel_name):
         print("AI validator error: " + str(e))
         return {"score": 5, "reason": "Error"}
 
-def is_signal_channel(username):
-    try:
-        sheet = get_sheets()
-        ws = sheet.worksheet('SignalChannels')
-        records = ws.get_all_records()
-        for row in records:
-            if row.get('Channel Username', '').lower() == username.lower():
-                return row.get('Active', '') == 'TRUE'
-        return False
-    except Exception as e:
-        print("Error checking signal channel: " + str(e))
-        return False
-
 def add_signal_channel(username, name):
     try:
         sheet = get_sheets()
         ws = sheet.worksheet('SignalChannels')
         ws.append_row([username, name, 'TRUE', now_baku()])
+        invalidate_channel_cache()
         print("Added " + username + " to SignalChannels")
     except Exception as e:
         print("Error adding channel: " + str(e))
@@ -279,6 +301,7 @@ async def main():
         sheet = get_sheets()
         tabs = [ws.title for ws in sheet.worksheets()]
         print("Google Sheets connected. Tabs: " + str(tabs))
+        get_signal_channels()
     except Exception as e:
         print("STARTUP Google Sheets ERROR: " + str(e))
 
