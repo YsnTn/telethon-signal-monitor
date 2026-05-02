@@ -34,6 +34,12 @@ CACHE_TTL = 900
 TRIAL_DAYS = 7
 TRIAL_MIN_SIGNALS = 5
 TRIAL_MIN_WIN_RATE = 50
+
+# Rate limiting
+MAX_SCANS_PER_HOUR = 5
+channel_scan_cooldown = {}  # username -> last scan timestamp
+scan_count_this_hour = 0
+scan_hour_reset = time.time()
 pending_channels = set()
 
 signal_channels_cache = {}
@@ -42,12 +48,36 @@ signal_channels_cache_time = 0
 print("All env vars loaded.")
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-# Global bot client reference for webhook use
 bot_client_ref = None
 
 def now_baku():
     return datetime.now(BAKU).strftime('%Y-%m-%d %H:%M:%S')
+
+def can_scan_channel(username):
+    global scan_count_this_hour, scan_hour_reset
+    now = time.time()
+
+    # Reset hourly counter
+    if now - scan_hour_reset > 3600:
+        scan_count_this_hour = 0
+        scan_hour_reset = now
+
+    # Max 5 new channel scans per hour
+    if scan_count_this_hour >= MAX_SCANS_PER_HOUR:
+        print("Rate limit: max scans per hour reached")
+        return False
+
+    # 24 hour cooldown per channel
+    last_scan = channel_scan_cooldown.get(username, 0)
+    if now - last_scan < 86400:
+        return False
+
+    return True
+
+def mark_channel_scanned(username):
+    global scan_count_this_hour
+    channel_scan_cooldown[username] = time.time()
+    scan_count_this_hour += 1
 
 def get_sheets():
     try:
@@ -154,7 +184,6 @@ def update_trial_stats(channel_name, hit_type):
                     days_elapsed = 0
 
                 win_rate = round((trial_tp / trial_signals) * 100, 1) if trial_signals > 0 else 0
-
                 ws.update('G' + str(row_num) + ':I' + str(row_num), [[trial_signals, trial_tp, trial_sl]])
 
                 print("Trial updated for " + str(channel_name) + ": " + str(trial_signals) + " signals, " + str(win_rate) + "% win rate, " + str(days_elapsed) + " days")
@@ -314,7 +343,6 @@ def validate_signal_with_ai(message_text, signal, channel_name):
 def analyze_channel_history(messages):
     try:
         if len(messages) < 3:
-            print("Too few messages to analyze channel")
             return {"is_signal_channel": False, "confidence": 0, "reason": "Too few messages"}
 
         text = '\n'.join(messages[:50])
@@ -389,7 +417,6 @@ async def handle_trial_update(request):
             return web.json_response({'error': 'missing channel or hitType'}, status=400)
 
         print("Webhook: trial update for " + str(channel) + " hit=" + str(hit_type))
-
         result = update_trial_stats(channel, hit_type)
 
         if result and result.get('graduated'):
@@ -482,14 +509,19 @@ async def main():
             channel_name = chat.title
 
             if not is_known_channel(username):
+                if not can_scan_channel(username):
+                    return
                 if username in pending_channels:
                     return
                 pending_channels.add(username)
                 try:
+                    mark_channel_scanned(username)
+                    await asyncio.sleep(2)
                     messages = []
                     async for msg in user_client.iter_messages(chat, limit=50):
                         if msg.text:
                             messages.append(msg.text)
+                        await asyncio.sleep(0.1)
                     analysis = analyze_channel_history(messages)
                     if analysis['confidence'] >= 80:
                         add_pending_channel(username, channel_name)
