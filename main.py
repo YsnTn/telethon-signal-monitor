@@ -5,6 +5,7 @@ import time
 from aiohttp import web
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl.custom import Button
 import anthropic
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -35,7 +36,6 @@ TRIAL_DAYS = 7
 TRIAL_MIN_SIGNALS = 5
 TRIAL_MIN_WIN_RATE = 50
 
-# Rate limiting
 MAX_SCANS_PER_HOUR = 5
 channel_scan_cooldown = {}
 scan_count_this_hour = 0
@@ -136,18 +136,41 @@ def add_pending_channel(username, name):
         sheet = get_sheets()
         ws = sheet.worksheet('SignalChannels')
         ws.append_row([
-            str(username),
-            str(name),
-            'FALSE',
-            now_baku(),
-            'PENDING',
-            now_baku(),
-            0, 0, 0
+            str(username), str(name), 'FALSE',
+            now_baku(), 'PENDING', now_baku(), 0, 0, 0
         ])
         invalidate_channel_cache()
         print("Added " + str(username) + " as PENDING")
     except Exception as e:
         print("Error adding pending channel: " + str(e))
+
+def mark_signal_tracked(signal_id):
+    try:
+        sheet = get_sheets()
+        ws = sheet.worksheet('Signals')
+        records = ws.get_all_records()
+        for i, row in enumerate(records):
+            if str(row.get('Signal ID', '')) == str(signal_id):
+                ws.update('O' + str(i + 2), [['OPEN_TRACKED']])
+                return True
+        return False
+    except Exception as e:
+        print("Error marking signal tracked: " + str(e))
+        return False
+
+def mark_signal_skipped(signal_id):
+    try:
+        sheet = get_sheets()
+        ws = sheet.worksheet('Signals')
+        records = ws.get_all_records()
+        for i, row in enumerate(records):
+            if str(row.get('Signal ID', '')) == str(signal_id):
+                ws.update('O' + str(i + 2), [['SKIPPED']])
+                return True
+        return False
+    except Exception as e:
+        print("Error marking signal skipped: " + str(e))
+        return False
 
 def update_trial_stats(channel_name, hit_type):
     try:
@@ -179,16 +202,10 @@ def update_trial_stats(channel_name, hit_type):
                 win_rate = round((trial_tp / trial_signals) * 100, 1) if trial_signals > 0 else 0
                 ws.update('G' + str(row_num) + ':I' + str(row_num), [[trial_signals, trial_tp, trial_sl]])
 
-                print("Trial updated for " + str(channel_name) + ": " + str(trial_signals) + " signals, " + str(win_rate) + "% win rate, " + str(days_elapsed) + " days")
-
                 if trial_signals >= TRIAL_MIN_SIGNALS and days_elapsed >= TRIAL_DAYS:
                     approve = win_rate >= TRIAL_MIN_WIN_RATE
-                    if approve:
-                        ws.update('C' + str(row_num), [['TRUE']])
-                        ws.update('E' + str(row_num), [['ACTIVE']])
-                    else:
-                        ws.update('C' + str(row_num), [['FALSE']])
-                        ws.update('E' + str(row_num), [['BLOCKED']])
+                    ws.update('C' + str(row_num), [['TRUE' if approve else 'FALSE']])
+                    ws.update('E' + str(row_num), [['ACTIVE' if approve else 'BLOCKED']])
                     invalidate_channel_cache()
                     return {
                         'graduated': True,
@@ -199,14 +216,8 @@ def update_trial_stats(channel_name, hit_type):
                         'username': str(row.get('Channel Username', channel_name))
                     }
 
-                return {
-                    'graduated': False,
-                    'win_rate': win_rate,
-                    'trial_signals': trial_signals,
-                    'days_elapsed': days_elapsed
-                }
+                return {'graduated': False, 'win_rate': win_rate, 'trial_signals': trial_signals, 'days_elapsed': days_elapsed}
 
-        print("Channel not found in SignalChannels: " + str(channel_name))
         return None
     except Exception as e:
         print("Error updating trial stats: " + str(e))
@@ -378,21 +389,13 @@ def save_signal(signal, channel_name, message_text, status='OPEN'):
         ws = sheet.worksheet('Signals')
         signal_id = str(signal['asset']) + '_' + datetime.now(BAKU).strftime('%Y%m%d%H%M%S')
         ws.append_row([
-            signal_id,
-            now_baku(),
-            signal.get('asset', ''),
-            channel_name,
-            signal.get('direction', ''),
-            signal.get('entry', ''),
-            signal.get('stop_loss', ''),
-            signal.get('tp1', ''),
-            signal.get('tp2', ''),
-            signal.get('tp3', ''),
-            signal.get('tp4', ''),
-            signal.get('tp5', ''),
-            signal.get('confidence', ''),
-            str(message_text)[:200],
-            status
+            signal_id, now_baku(),
+            signal.get('asset', ''), channel_name,
+            signal.get('direction', ''), signal.get('entry', ''),
+            signal.get('stop_loss', ''), signal.get('tp1', ''),
+            signal.get('tp2', ''), signal.get('tp3', ''),
+            signal.get('tp4', ''), signal.get('tp5', ''),
+            signal.get('confidence', ''), str(message_text)[:200], status
         ])
         return signal_id
     except Exception as e:
@@ -404,44 +407,23 @@ async def handle_trial_update(request):
         data = await request.json()
         channel = data.get('channel', '')
         hit_type = data.get('hitType', '')
-
         if not channel or not hit_type:
             return web.json_response({'error': 'missing channel or hitType'}, status=400)
-
         print("Webhook: trial update for " + str(channel) + " hit=" + str(hit_type))
         result = update_trial_stats(channel, hit_type)
-
         if result and result.get('graduated'):
             approved = result.get('approved')
             win_rate = result.get('win_rate')
             trial_signals = result.get('trial_signals')
             channel_name = result.get('channel_name', channel)
             username = result.get('username', channel)
-
             if approved:
-                msg = (
-                    "CHANNEL APPROVED\n\n"
-                    "Channel: " + str(username) + "\n"
-                    "Name: " + str(channel_name) + "\n"
-                    "Win Rate: " + str(win_rate) + "%\n"
-                    "Trial Signals: " + str(trial_signals) + "\n\n"
-                    "Now receiving live signal alerts from this channel."
-                )
+                msg = "CHANNEL APPROVED\n\nChannel: " + str(username) + "\nName: " + str(channel_name) + "\nWin Rate: " + str(win_rate) + "%\nTrial Signals: " + str(trial_signals) + "\n\nNow receiving live signal alerts from this channel."
             else:
-                msg = (
-                    "CHANNEL BLOCKED\n\n"
-                    "Channel: " + str(username) + "\n"
-                    "Name: " + str(channel_name) + "\n"
-                    "Win Rate: " + str(win_rate) + "% (below 50%)\n"
-                    "Trial Signals: " + str(trial_signals) + "\n\n"
-                    "Channel did not meet quality threshold. Blocked."
-                )
-
+                msg = "CHANNEL BLOCKED\n\nChannel: " + str(username) + "\nName: " + str(channel_name) + "\nWin Rate: " + str(win_rate) + "% (below 50%)\nTrial Signals: " + str(trial_signals) + "\n\nChannel did not meet quality threshold. Blocked."
             if bot_client_ref:
                 asyncio.create_task(bot_client_ref.send_message(PERSONAL_CHAT_ID, msg))
-
         return web.json_response({'ok': True, 'result': result})
-
     except Exception as e:
         print("Webhook error: " + str(e))
         return web.json_response({'error': str(e)}, status=500)
@@ -451,14 +433,11 @@ async def handle_score_update(request):
         data = await request.json()
         channel = data.get('channel', '')
         hit_type = data.get('hitType', '')
-
         if not channel or not hit_type:
             return web.json_response({'error': 'missing channel or hitType'}, status=400)
-
         print("Score update webhook: " + str(channel) + " hit=" + str(hit_type))
         trust_score = update_channel_score(channel, hit_type)
         return web.json_response({'ok': True, 'trust_score': trust_score})
-
     except Exception as e:
         print("Score update webhook error: " + str(e))
         return web.json_response({'error': str(e)}, status=500)
@@ -509,6 +488,30 @@ async def main():
 
     await start_webhook_server()
 
+    # Handle inline button callbacks
+    @bot_client.on(events.CallbackQuery)
+    async def callback_handler(event):
+        try:
+            data = event.data.decode('utf-8')
+            if data.startswith('track_'):
+                signal_id = data[6:]
+                success = mark_signal_tracked(signal_id)
+                if success:
+                    await event.answer("Tracking signal! You will be notified when TP/SL is hit.")
+                    await event.edit("TRACKING: " + signal_id + "\nYou will be notified when TP or SL is hit.")
+                else:
+                    await event.answer("Error marking signal.")
+            elif data.startswith('skip_'):
+                signal_id = data[5:]
+                success = mark_signal_skipped(signal_id)
+                if success:
+                    await event.answer("Signal skipped.")
+                    await event.edit("SKIPPED: " + signal_id)
+                else:
+                    await event.answer("Error skipping signal.")
+        except Exception as e:
+            print("Callback error: " + str(e))
+
     @user_client.on(events.NewMessage)
     async def handler(event):
         try:
@@ -537,21 +540,12 @@ async def main():
                         add_pending_channel(username, channel_name)
                         await bot_client.send_message(
                             PERSONAL_CHAT_ID,
-                            "TRIAL STARTED\n\n"
-                            "Channel: " + str(username) + "\n"
-                            "Name: " + str(channel_name) + "\n"
-                            "Confidence: " + str(analysis['confidence']) + "%\n"
-                            "Reason: " + str(analysis['reason']) + "\n\n"
-                            "Monitoring for " + str(TRIAL_DAYS) + " days / " + str(TRIAL_MIN_SIGNALS) + "+ signals.\n"
-                            "Will notify you when trial is complete."
+                            "TRIAL STARTED\n\nChannel: " + str(username) + "\nName: " + str(channel_name) + "\nConfidence: " + str(analysis['confidence']) + "%\nReason: " + str(analysis['reason']) + "\n\nMonitoring for " + str(TRIAL_DAYS) + " days / " + str(TRIAL_MIN_SIGNALS) + "+ signals.\nWill notify you when trial is complete."
                         )
                     elif analysis['confidence'] >= 40:
                         await bot_client.send_message(
                             PERSONAL_CHAT_ID,
-                            "Possible signal channel: " + str(username) + "\n"
-                            "Confidence: " + str(analysis['confidence']) + "%\n"
-                            "Reason: " + str(analysis['reason']) + "\n"
-                            "(Below threshold, not added)"
+                            "Possible signal channel: " + str(username) + "\nConfidence: " + str(analysis['confidence']) + "%\nReason: " + str(analysis['reason']) + "\n(Below threshold, not added)"
                         )
                 finally:
                     pending_channels.discard(username)
@@ -629,9 +623,14 @@ async def main():
                     "AI Score: " + str(validation['score']) + "/10\n"
                     "Lot Size: " + lot_text + " (2% risk / $10)\n"
                     "Channel Trust: " + trust_label + " (" + str(trust_score) + "% / " + str(total_signals) + " signals)\n"
-                    "Channel: " + str(channel_name)
+                    "Channel: " + str(channel_name) + "\n\n"
+                    "Do you want to track this signal?"
                 )
-                await bot_client.send_message(PERSONAL_CHAT_ID, msg)
+                buttons = [
+                    [Button.inline("✅ Track", data="track_" + signal_id),
+                     Button.inline("❌ Skip", data="skip_" + signal_id)]
+                ]
+                await bot_client.send_message(PERSONAL_CHAT_ID, msg, buttons=buttons)
         except Exception as e:
             print("Error processing message: " + str(e))
 
