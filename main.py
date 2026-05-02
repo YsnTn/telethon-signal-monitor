@@ -37,7 +37,7 @@ TRIAL_MIN_WIN_RATE = 50
 
 # Rate limiting
 MAX_SCANS_PER_HOUR = 5
-channel_scan_cooldown = {}  # username -> last scan timestamp
+channel_scan_cooldown = {}
 scan_count_this_hour = 0
 scan_hour_reset = time.time()
 pending_channels = set()
@@ -56,22 +56,15 @@ def now_baku():
 def can_scan_channel(username):
     global scan_count_this_hour, scan_hour_reset
     now = time.time()
-
-    # Reset hourly counter
     if now - scan_hour_reset > 3600:
         scan_count_this_hour = 0
         scan_hour_reset = now
-
-    # Max 5 new channel scans per hour
     if scan_count_this_hour >= MAX_SCANS_PER_HOUR:
         print("Rate limit: max scans per hour reached")
         return False
-
-    # 24 hour cooldown per channel
     last_scan = channel_scan_cooldown.get(username, 0)
     if now - last_scan < 86400:
         return False
-
     return True
 
 def mark_channel_scanned(username):
@@ -344,7 +337,6 @@ def analyze_channel_history(messages):
     try:
         if len(messages) < 3:
             return {"is_signal_channel": False, "confidence": 0, "reason": "Too few messages"}
-
         text = '\n'.join(messages[:50])
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -454,12 +446,30 @@ async def handle_trial_update(request):
         print("Webhook error: " + str(e))
         return web.json_response({'error': str(e)}, status=500)
 
+async def handle_score_update(request):
+    try:
+        data = await request.json()
+        channel = data.get('channel', '')
+        hit_type = data.get('hitType', '')
+
+        if not channel or not hit_type:
+            return web.json_response({'error': 'missing channel or hitType'}, status=400)
+
+        print("Score update webhook: " + str(channel) + " hit=" + str(hit_type))
+        trust_score = update_channel_score(channel, hit_type)
+        return web.json_response({'ok': True, 'trust_score': trust_score})
+
+    except Exception as e:
+        print("Score update webhook error: " + str(e))
+        return web.json_response({'error': str(e)}, status=500)
+
 async def handle_health(request):
     return web.json_response({'status': 'ok', 'time': now_baku()})
 
 async def start_webhook_server():
     app = web.Application()
     app.router.add_post('/trial-update', handle_trial_update)
+    app.router.add_post('/score-update', handle_score_update)
     app.router.add_get('/health', handle_health)
     runner = web.AppRunner(app)
     await runner.setup()
