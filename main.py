@@ -144,33 +144,32 @@ def add_pending_channel(username, name):
     except Exception as e:
         print("Error adding pending channel: " + str(e))
 
-def mark_signal_tracked(signal_id):
+def update_signal_status(signal_id, status):
     try:
         sheet = get_sheets()
         ws = sheet.worksheet('Signals')
         records = ws.get_all_records()
         for i, row in enumerate(records):
             if str(row.get('Signal ID', '')) == str(signal_id):
-                ws.update('O' + str(i + 2), [['OPEN_TRACKED']])
+                ws.update('O' + str(i + 2), [[status]])
                 return True
         return False
     except Exception as e:
-        print("Error marking signal tracked: " + str(e))
+        print("Error updating signal status: " + str(e))
         return False
 
-def mark_signal_skipped(signal_id):
+def get_signal_info(signal_id):
     try:
         sheet = get_sheets()
         ws = sheet.worksheet('Signals')
         records = ws.get_all_records()
-        for i, row in enumerate(records):
+        for row in records:
             if str(row.get('Signal ID', '')) == str(signal_id):
-                ws.update('O' + str(i + 2), [['SKIPPED']])
-                return True
-        return False
+                return row
+        return None
     except Exception as e:
-        print("Error marking signal skipped: " + str(e))
-        return False
+        print("Error getting signal info: " + str(e))
+        return None
 
 def update_trial_stats(channel_name, hit_type):
     try:
@@ -488,27 +487,66 @@ async def main():
 
     await start_webhook_server()
 
-    # Handle inline button callbacks
     @bot_client.on(events.CallbackQuery)
     async def callback_handler(event):
         try:
             data = event.data.decode('utf-8')
+
+            # Track signal
             if data.startswith('track_'):
                 signal_id = data[6:]
-                success = mark_signal_tracked(signal_id)
+                success = update_signal_status(signal_id, 'OPEN_TRACKED')
                 if success:
-                    await event.answer("Tracking signal! You will be notified when TP/SL is hit.")
-                    await event.edit("TRACKING: " + signal_id + "\nYou will be notified when TP or SL is hit.")
+                    signal = get_signal_info(signal_id)
+                    asset = signal.get('Asset', '') if signal else ''
+                    direction = signal.get('Direction', '') if signal else ''
+                    entry = signal.get('Entry', '') if signal else ''
+                    await event.answer("Tracking signal!")
+                    await event.edit(
+                        "TRACKING\n\n"
+                        "ID: " + str(signal_id) + "\n"
+                        "Asset: " + str(asset) + "\n"
+                        "Direction: " + str(direction) + "\n"
+                        "Entry: " + str(entry) + "\n\n"
+                        "You will be notified when TP or SL is hit.",
+                        buttons=[[Button.inline("🛑 Stop Tracking", data="stoptrack_" + signal_id)]]
+                    )
                 else:
-                    await event.answer("Error marking signal.")
+                    await event.answer("Error tracking signal.")
+
+            # Skip signal
             elif data.startswith('skip_'):
                 signal_id = data[5:]
-                success = mark_signal_skipped(signal_id)
-                if success:
-                    await event.answer("Signal skipped.")
-                    await event.edit("SKIPPED: " + signal_id)
-                else:
-                    await event.answer("Error skipping signal.")
+                update_signal_status(signal_id, 'SKIPPED')
+                await event.answer("Signal skipped.")
+                await event.edit("SKIPPED: " + signal_id)
+
+            # Stop tracking
+            elif data.startswith('stoptrack_'):
+                signal_id = data[10:]
+                update_signal_status(signal_id, 'CLOSED')
+                await event.answer("Stopped tracking.")
+                await event.edit("CLOSED: " + signal_id + "\nTracking stopped manually.")
+
+            # Add channel to trial
+            elif data.startswith('addtrial_'):
+                username_clean = data[9:]
+                username = '@' + username_clean
+                add_pending_channel(username, username_clean)
+                await event.answer("Channel added to trial!")
+                await event.edit(
+                    "TRIAL STARTED\n\n"
+                    "Channel: " + username + "\n"
+                    "Monitoring for " + str(TRIAL_DAYS) + " days / " + str(TRIAL_MIN_SIGNALS) + "+ signals.\n"
+                    "Will notify you when trial is complete."
+                )
+
+            # Skip channel
+            elif data.startswith('skipchannel_'):
+                username = '@' + data[12:]
+                await event.answer("Channel skipped.")
+                await event.edit("SKIPPED channel: " + username)
+
         except Exception as e:
             print("Callback error: " + str(e))
 
@@ -536,17 +574,25 @@ async def main():
                             messages.append(msg.text)
                         await asyncio.sleep(0.1)
                     analysis = analyze_channel_history(messages)
-                    if analysis['confidence'] >= 80:
+                    if analysis['confidence'] >= 70:
                         add_pending_channel(username, channel_name)
                         await bot_client.send_message(
                             PERSONAL_CHAT_ID,
                             "TRIAL STARTED\n\nChannel: " + str(username) + "\nName: " + str(channel_name) + "\nConfidence: " + str(analysis['confidence']) + "%\nReason: " + str(analysis['reason']) + "\n\nMonitoring for " + str(TRIAL_DAYS) + " days / " + str(TRIAL_MIN_SIGNALS) + "+ signals.\nWill notify you when trial is complete."
                         )
                     elif analysis['confidence'] >= 40:
-                        await bot_client.send_message(
-                            PERSONAL_CHAT_ID,
-                            "Possible signal channel: " + str(username) + "\nConfidence: " + str(analysis['confidence']) + "%\nReason: " + str(analysis['reason']) + "\n(Below threshold, not added)"
+                        msg = (
+                            "Possible signal channel: " + str(username) + "\n"
+                            "Name: " + str(channel_name) + "\n"
+                            "Confidence: " + str(analysis['confidence']) + "%\n"
+                            "Reason: " + str(analysis['reason']) + "\n\n"
+                            "Do you want to add this channel to trial?"
                         )
+                        buttons = [
+                            [Button.inline("✅ Add to Trial", data="addtrial_" + str(username).replace('@', '')),
+                             Button.inline("❌ Skip", data="skipchannel_" + str(username).replace('@', ''))]
+                        ]
+                        await bot_client.send_message(PERSONAL_CHAT_ID, msg, buttons=buttons)
                 finally:
                     pending_channels.discard(username)
                 return
