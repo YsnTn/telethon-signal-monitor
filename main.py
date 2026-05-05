@@ -2,6 +2,7 @@ import os
 import asyncio
 import json
 import time
+import signal as signal_module
 from aiohttp import web
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -13,11 +14,6 @@ from datetime import datetime
 from pytz import timezone as pytz_timezone
 
 print("Starting up...")
-print("API_ID set: " + str(bool(os.environ.get('API_ID'))))
-print("SESSION_STRING set: " + str(bool(os.environ.get('SESSION_STRING'))))
-print("BOT_TOKEN set: " + str(bool(os.environ.get('BOT_TOKEN'))))
-print("GOOGLE_CREDENTIALS set: " + str(bool(os.environ.get('GOOGLE_CREDENTIALS'))))
-print("SPREADSHEET_ID set: " + str(bool(os.environ.get('SPREADSHEET_ID'))))
 
 BAKU = pytz_timezone('Asia/Baku')
 
@@ -177,7 +173,6 @@ def update_trial_stats(channel_name, hit_type):
         ws = sheet.worksheet('SignalChannels')
         records = ws.get_all_records()
         is_tp = hit_type.startswith('TP')
-
         for i, row in enumerate(records):
             row_channel = str(row.get('Channel Name', '')).lower().strip()
             row_username = str(row.get('Channel Username', '')).lower().strip()
@@ -186,21 +181,17 @@ def update_trial_stats(channel_name, hit_type):
                 status = str(row.get('Status', '')).upper().strip()
                 if status != 'PENDING':
                     return None
-
                 trial_signals = int(row.get('Trial Signals', 0)) + 1
                 trial_tp = int(row.get('Trial TP Hits', 0)) + (1 if is_tp else 0)
                 trial_sl = int(row.get('Trial SL Hits', 0)) + (0 if is_tp else 1)
                 trial_start = str(row.get('Trial Start', now_baku()))
-
                 try:
                     start_dt = datetime.strptime(trial_start[:10], '%Y-%m-%d')
                     days_elapsed = (datetime.now() - start_dt).days
                 except:
                     days_elapsed = 0
-
                 win_rate = round((trial_tp / trial_signals) * 100, 1) if trial_signals > 0 else 0
                 ws.update('G' + str(row_num) + ':I' + str(row_num), [[trial_signals, trial_tp, trial_sl]])
-
                 if trial_signals >= TRIAL_MIN_SIGNALS and days_elapsed >= TRIAL_DAYS:
                     approve = win_rate >= TRIAL_MIN_WIN_RATE
                     ws.update('C' + str(row_num), [['TRUE' if approve else 'FALSE']])
@@ -214,9 +205,7 @@ def update_trial_stats(channel_name, hit_type):
                         'channel_name': str(row.get('Channel Name', channel_name)),
                         'username': str(row.get('Channel Username', channel_name))
                     }
-
                 return {'graduated': False, 'win_rate': win_rate, 'trial_signals': trial_signals, 'days_elapsed': days_elapsed}
-
         return None
     except Exception as e:
         print("Error updating trial stats: " + str(e))
@@ -245,7 +234,6 @@ def update_channel_score(channel_name, hit_type):
         ws = sheet.worksheet('ChannelScores')
         records = ws.get_all_records()
         is_tp = hit_type.startswith('TP')
-
         for i, row in enumerate(records):
             if str(row.get('Channel Name', '')).lower() == str(channel_name).lower():
                 row_num = i + 2
@@ -255,11 +243,8 @@ def update_channel_score(channel_name, hit_type):
                 hit_rate = round((tp_hits / total) * 100, 1)
                 weight = min(total / 10, 1.0)
                 trust_score = round(hit_rate * weight, 1)
-                ws.update('B' + str(row_num) + ':G' + str(row_num), [[
-                    total, tp_hits, sl_hits, hit_rate, trust_score, now_baku()
-                ]])
+                ws.update('B' + str(row_num) + ':G' + str(row_num), [[total, tp_hits, sl_hits, hit_rate, trust_score, now_baku()]])
                 return trust_score
-
         total = 1
         tp_hits = 1 if is_tp else 0
         sl_hits = 0 if is_tp else 1
@@ -330,15 +315,10 @@ def validate_signal_with_ai(message_text, signal, channel_name):
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=200,
-            messages=[{
-                "role": "user",
-                "content": "Score this trading signal quality from 1-10.\nChannel: " + str(channel_name) + "\nMessage: " + str(message_text) + "\nExtracted: " + json.dumps(signal) + "\n\nCriteria: clear entry, reasonable SL/TP, valid asset, RR ratio >= 1:1, not vague.\nRespond in JSON only, no markdown: {\"score\": 7, \"reason\": \"brief reason\"}"
-            }]
+            messages=[{"role": "user", "content": "Score this trading signal quality from 1-10.\nChannel: " + str(channel_name) + "\nMessage: " + str(message_text) + "\nExtracted: " + json.dumps(signal) + "\n\nCriteria: clear entry, reasonable SL/TP, valid asset, RR ratio >= 1:1, not vague.\nRespond in JSON only, no markdown: {\"score\": 7, \"reason\": \"brief reason\"}"}]
         )
         result = parse_claude_json(response.content[0].text)
-        if result:
-            return result
-        return {"score": 5, "reason": "Parse error"}
+        return result if result else {"score": 5, "reason": "Parse error"}
     except Exception as e:
         print("AI validator error: " + str(e))
         return {"score": 5, "reason": "Error"}
@@ -351,15 +331,10 @@ def analyze_channel_history(messages):
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=500,
-            messages=[{
-                "role": "user",
-                "content": "Analyze these Telegram channel messages. Is this a TRADING SIGNAL channel?\n\nA trading signal channel MUST have ALL of these:\n- Specific BUY or SELL direction\n- Specific entry price\n- Specific Stop Loss price\n- At least one Take Profit price\n- At least 3 such signals visible in the messages\n\nNEWS channels, price update channels, analysis channels, and educational channels are NOT signal channels even if they mention prices or assets.\n\nMessages:\n" + text + "\n\nRespond in JSON only, no markdown: {\"is_signal_channel\": true, \"confidence\": 85, \"reason\": \"brief reason\"}\n\nBe strict. If fewer than 3 complete signals with entry+SL+TP are visible, confidence must be below 40."
-            }]
+            messages=[{"role": "user", "content": "Analyze these Telegram channel messages. Is this a TRADING SIGNAL channel?\n\nA trading signal channel MUST have ALL of these:\n- Specific BUY or SELL direction\n- Specific entry price\n- Specific Stop Loss price\n- At least one Take Profit price\n- At least 3 such signals visible in the messages\n\nNEWS channels, price update channels, analysis channels, and educational channels are NOT signal channels even if they mention prices or assets.\n\nMessages:\n" + text + "\n\nRespond in JSON only, no markdown: {\"is_signal_channel\": true, \"confidence\": 85, \"reason\": \"brief reason\"}\n\nBe strict. If fewer than 3 complete signals with entry+SL+TP are visible, confidence must be below 40."}]
         )
         result = parse_claude_json(response.content[0].text)
-        if result:
-            return result
-        return {"is_signal_channel": False, "confidence": 0, "reason": "Parse error"}
+        return result if result else {"is_signal_channel": False, "confidence": 0, "reason": "Parse error"}
     except Exception as e:
         print("analyze_channel_history error: " + str(e))
         return {"is_signal_channel": False, "confidence": 0, "reason": "Error"}
@@ -369,15 +344,10 @@ def extract_signal(message_text, channel_name):
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=500,
-            messages=[{
-                "role": "user",
-                "content": "Extract trading signal from this message.\nChannel: " + str(channel_name) + "\nMessage: " + str(message_text) + "\n\nRespond in JSON only, no markdown (use null for missing fields):\n{\"is_signal\": true, \"asset\": \"XAUUSD\", \"direction\": \"BUY\", \"entry\": 4700, \"stop_loss\": 4650, \"tp1\": 4750, \"tp2\": 4800, \"tp3\": null, \"tp4\": null, \"tp5\": null, \"confidence\": \"High\"}"
-            }]
+            messages=[{"role": "user", "content": "Extract trading signal from this message.\nChannel: " + str(channel_name) + "\nMessage: " + str(message_text) + "\n\nRespond in JSON only, no markdown (use null for missing fields):\n{\"is_signal\": true, \"asset\": \"XAUUSD\", \"direction\": \"BUY\", \"entry\": 4700, \"stop_loss\": 4650, \"tp1\": 4750, \"tp2\": 4800, \"tp3\": null, \"tp4\": null, \"tp5\": null, \"confidence\": \"High\"}"}]
         )
         result = parse_claude_json(response.content[0].text)
-        if result:
-            return result
-        return {"is_signal": False}
+        return result if result else {"is_signal": False}
     except Exception as e:
         print("extract_signal error: " + str(e))
         return {"is_signal": False}
@@ -387,15 +357,7 @@ def save_signal(signal, channel_name, message_text, status='OPEN'):
         sheet = get_sheets()
         ws = sheet.worksheet('Signals')
         signal_id = str(signal['asset']) + '_' + datetime.now(BAKU).strftime('%Y%m%d%H%M%S')
-        ws.append_row([
-            signal_id, now_baku(),
-            signal.get('asset', ''), channel_name,
-            signal.get('direction', ''), signal.get('entry', ''),
-            signal.get('stop_loss', ''), signal.get('tp1', ''),
-            signal.get('tp2', ''), signal.get('tp3', ''),
-            signal.get('tp4', ''), signal.get('tp5', ''),
-            signal.get('confidence', ''), str(message_text)[:200], status
-        ])
+        ws.append_row([signal_id, now_baku(), signal.get('asset', ''), channel_name, signal.get('direction', ''), signal.get('entry', ''), signal.get('stop_loss', ''), signal.get('tp1', ''), signal.get('tp2', ''), signal.get('tp3', ''), signal.get('tp4', ''), signal.get('tp5', ''), signal.get('confidence', ''), str(message_text)[:200], status])
         return signal_id
     except Exception as e:
         print("Error saving signal: " + str(e))
@@ -408,7 +370,6 @@ async def handle_trial_update(request):
         hit_type = data.get('hitType', '')
         if not channel or not hit_type:
             return web.json_response({'error': 'missing channel or hitType'}, status=400)
-        print("Webhook: trial update for " + str(channel) + " hit=" + str(hit_type))
         result = update_trial_stats(channel, hit_type)
         if result and result.get('graduated'):
             approved = result.get('approved')
@@ -417,9 +378,9 @@ async def handle_trial_update(request):
             channel_name = result.get('channel_name', channel)
             username = result.get('username', channel)
             if approved:
-                msg = "CHANNEL APPROVED\n\nChannel: " + str(username) + "\nName: " + str(channel_name) + "\nWin Rate: " + str(win_rate) + "%\nTrial Signals: " + str(trial_signals) + "\n\nNow receiving live signal alerts from this channel."
+                msg = "CHANNEL APPROVED\n\nChannel: " + str(username) + "\nName: " + str(channel_name) + "\nWin Rate: " + str(win_rate) + "%\nTrial Signals: " + str(trial_signals) + "\n\nNow receiving live signal alerts."
             else:
-                msg = "CHANNEL BLOCKED\n\nChannel: " + str(username) + "\nName: " + str(channel_name) + "\nWin Rate: " + str(win_rate) + "% (below 50%)\nTrial Signals: " + str(trial_signals) + "\n\nChannel did not meet quality threshold. Blocked."
+                msg = "CHANNEL BLOCKED\n\nChannel: " + str(username) + "\nWin Rate: " + str(win_rate) + "% (below 50%)\nTrial Signals: " + str(trial_signals)
             if bot_client_ref:
                 asyncio.create_task(bot_client_ref.send_message(PERSONAL_CHAT_ID, msg))
         return web.json_response({'ok': True, 'result': result})
@@ -434,7 +395,6 @@ async def handle_score_update(request):
         hit_type = data.get('hitType', '')
         if not channel or not hit_type:
             return web.json_response({'error': 'missing channel or hitType'}, status=400)
-        print("Score update webhook: " + str(channel) + " hit=" + str(hit_type))
         trust_score = update_channel_score(channel, hit_type)
         return web.json_response({'ok': True, 'trust_score': trust_score})
     except Exception as e:
@@ -459,8 +419,29 @@ async def main():
     global bot_client_ref
     print("Entering main()...")
 
-    user_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    user_client = TelegramClient(
+        StringSession(SESSION_STRING),
+        API_ID,
+        API_HASH,
+        device_model="iPhone 15",
+        system_version="17.0",
+        app_version="10.3.2",
+        lang_code="en",
+        system_lang_code="en",
+        connection_retries=1,
+        retry_delay=5,
+        auto_reconnect=False
+    )
+
     bot_client = TelegramClient('bot_session', API_ID, API_HASH)
+
+    def graceful_shutdown(signum, frame):
+        print("Received shutdown signal, disconnecting...")
+        asyncio.create_task(user_client.disconnect())
+        asyncio.create_task(bot_client.disconnect())
+
+    signal_module.signal(signal_module.SIGTERM, graceful_shutdown)
+    signal_module.signal(signal_module.SIGINT, graceful_shutdown)
 
     print("Starting bot client...")
     await bot_client.start(bot_token=BOT_TOKEN)
@@ -472,7 +453,7 @@ async def main():
     print("User client connected.")
 
     if not await user_client.is_user_authorized():
-        print("ERROR: SESSION_STRING is invalid or expired. Re-generate it.")
+        print("ERROR: SESSION_STRING is invalid or expired.")
         return
 
     print("Telethon started! User client authorized.")
@@ -491,8 +472,6 @@ async def main():
     async def callback_handler(event):
         try:
             data = event.data.decode('utf-8')
-
-            # Track signal
             if data.startswith('track_'):
                 signal_id = data[6:]
                 success = update_signal_status(signal_id, 'OPEN_TRACKED')
@@ -503,50 +482,31 @@ async def main():
                     entry = signal.get('Entry', '') if signal else ''
                     await event.answer("Tracking signal!")
                     await event.edit(
-                        "TRACKING\n\n"
-                        "ID: " + str(signal_id) + "\n"
-                        "Asset: " + str(asset) + "\n"
-                        "Direction: " + str(direction) + "\n"
-                        "Entry: " + str(entry) + "\n\n"
-                        "You will be notified when TP or SL is hit.",
+                        "TRACKING\n\nID: " + str(signal_id) + "\nAsset: " + str(asset) + "\nDirection: " + str(direction) + "\nEntry: " + str(entry) + "\n\nYou will be notified when TP or SL is hit.",
                         buttons=[[Button.inline("🛑 Stop Tracking", data="stoptrack_" + signal_id)]]
                     )
                 else:
                     await event.answer("Error tracking signal.")
-
-            # Skip signal
             elif data.startswith('skip_'):
                 signal_id = data[5:]
                 update_signal_status(signal_id, 'SKIPPED')
                 await event.answer("Signal skipped.")
                 await event.edit("SKIPPED: " + signal_id)
-
-            # Stop tracking
             elif data.startswith('stoptrack_'):
                 signal_id = data[10:]
                 update_signal_status(signal_id, 'CLOSED')
                 await event.answer("Stopped tracking.")
                 await event.edit("CLOSED: " + signal_id + "\nTracking stopped manually.")
-
-            # Add channel to trial
             elif data.startswith('addtrial_'):
                 username_clean = data[9:]
                 username = '@' + username_clean
                 add_pending_channel(username, username_clean)
                 await event.answer("Channel added to trial!")
-                await event.edit(
-                    "TRIAL STARTED\n\n"
-                    "Channel: " + username + "\n"
-                    "Monitoring for " + str(TRIAL_DAYS) + " days / " + str(TRIAL_MIN_SIGNALS) + "+ signals.\n"
-                    "Will notify you when trial is complete."
-                )
-
-            # Skip channel
+                await event.edit("TRIAL STARTED\n\nChannel: " + username + "\nMonitoring for " + str(TRIAL_DAYS) + " days / " + str(TRIAL_MIN_SIGNALS) + "+ signals.")
             elif data.startswith('skipchannel_'):
                 username = '@' + data[12:]
                 await event.answer("Channel skipped.")
                 await event.edit("SKIPPED channel: " + username)
-
         except Exception as e:
             print("Callback error: " + str(e))
 
@@ -576,22 +536,10 @@ async def main():
                     analysis = analyze_channel_history(messages)
                     if analysis['confidence'] >= 70:
                         add_pending_channel(username, channel_name)
-                        await bot_client.send_message(
-                            PERSONAL_CHAT_ID,
-                            "TRIAL STARTED\n\nChannel: " + str(username) + "\nName: " + str(channel_name) + "\nConfidence: " + str(analysis['confidence']) + "%\nReason: " + str(analysis['reason']) + "\n\nMonitoring for " + str(TRIAL_DAYS) + " days / " + str(TRIAL_MIN_SIGNALS) + "+ signals.\nWill notify you when trial is complete."
-                        )
+                        await bot_client.send_message(PERSONAL_CHAT_ID, "TRIAL STARTED\n\nChannel: " + str(username) + "\nName: " + str(channel_name) + "\nConfidence: " + str(analysis['confidence']) + "%\nReason: " + str(analysis['reason']) + "\n\nMonitoring for " + str(TRIAL_DAYS) + " days / " + str(TRIAL_MIN_SIGNALS) + "+ signals.")
                     elif analysis['confidence'] >= 40:
-                        msg = (
-                            "Possible signal channel: " + str(username) + "\n"
-                            "Name: " + str(channel_name) + "\n"
-                            "Confidence: " + str(analysis['confidence']) + "%\n"
-                            "Reason: " + str(analysis['reason']) + "\n\n"
-                            "Do you want to add this channel to trial?"
-                        )
-                        buttons = [
-                            [Button.inline("✅ Add to Trial", data="addtrial_" + str(username).replace('@', '')),
-                             Button.inline("❌ Skip", data="skipchannel_" + str(username).replace('@', ''))]
-                        ]
+                        msg = "Possible signal channel: " + str(username) + "\nName: " + str(channel_name) + "\nConfidence: " + str(analysis['confidence']) + "%\nReason: " + str(analysis['reason']) + "\n\nDo you want to add this channel to trial?"
+                        buttons = [[Button.inline("✅ Add to Trial", data="addtrial_" + str(username).replace('@', '')), Button.inline("❌ Skip", data="skipchannel_" + str(username).replace('@', ''))]]
                         await bot_client.send_message(PERSONAL_CHAT_ID, msg, buttons=buttons)
                 finally:
                     pending_channels.discard(username)
@@ -657,25 +605,8 @@ async def main():
 
             signal_id = save_signal(signal, channel_name, event.message.text, status='OPEN')
             if signal_id:
-                msg = (
-                    "NEW SIGNAL\n\n"
-                    "ID: " + str(signal_id) + "\n"
-                    "Asset: " + str(signal.get('asset')) + "\n"
-                    "Direction: " + str(signal.get('direction')) + "\n"
-                    "Entry: " + str(entry) + "\n"
-                    "SL: " + str(sl) + "\n"
-                    "TP1: " + str(signal.get('tp1')) + "\n"
-                    "TP2: " + str(signal.get('tp2')) + "\n"
-                    "AI Score: " + str(validation['score']) + "/10\n"
-                    "Lot Size: " + lot_text + " (2% risk / $10)\n"
-                    "Channel Trust: " + trust_label + " (" + str(trust_score) + "% / " + str(total_signals) + " signals)\n"
-                    "Channel: " + str(channel_name) + "\n\n"
-                    "Do you want to track this signal?"
-                )
-                buttons = [
-                    [Button.inline("✅ Track", data="track_" + signal_id),
-                     Button.inline("❌ Skip", data="skip_" + signal_id)]
-                ]
+                msg = ("NEW SIGNAL\n\nID: " + str(signal_id) + "\nAsset: " + str(signal.get('asset')) + "\nDirection: " + str(signal.get('direction')) + "\nEntry: " + str(entry) + "\nSL: " + str(sl) + "\nTP1: " + str(signal.get('tp1')) + "\nTP2: " + str(signal.get('tp2')) + "\nAI Score: " + str(validation['score']) + "/10\nLot Size: " + lot_text + " (2% risk / $10)\nChannel Trust: " + trust_label + " (" + str(trust_score) + "% / " + str(total_signals) + " signals)\nChannel: " + str(channel_name) + "\n\nDo you want to track this signal?")
+                buttons = [[Button.inline("✅ Track", data="track_" + signal_id), Button.inline("❌ Skip", data="skip_" + signal_id)]]
                 await bot_client.send_message(PERSONAL_CHAT_ID, msg, buttons=buttons)
         except Exception as e:
             print("Error processing message: " + str(e))
@@ -686,13 +617,4 @@ async def main():
     )
 
 if __name__ == '__main__':
-    while True:
-        try:
-            asyncio.run(main())
-            break
-        except Exception as e:
-            if 'AuthKeyDuplicated' in str(e):
-                print("AuthKeyDuplicated - waiting 30s for old instance to die...")
-                time.sleep(30)
-            else:
-                raise
+    asyncio.run(main())
