@@ -435,10 +435,10 @@ async def main():
 
     bot_client = TelegramClient('bot_session', API_ID, API_HASH)
 
-    def graceful_shutdown(signum, frame):
+   def graceful_shutdown(signum, frame):
         print("Received shutdown signal, disconnecting...")
-        asyncio.create_task(user_client.disconnect())
-        asyncio.create_task(bot_client.disconnect())
+        user_client.disconnect()
+        bot_client.disconnect()
 
     signal_module.signal(signal_module.SIGTERM, graceful_shutdown)
     signal_module.signal(signal_module.SIGINT, graceful_shutdown)
