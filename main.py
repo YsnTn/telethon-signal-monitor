@@ -1,3 +1,5 @@
+from dotenv import load_dotenv
+load_dotenv("/app/.env")
 import os
 import asyncio
 import json
@@ -25,12 +27,13 @@ PERSONAL_CHAT_ID = int(os.environ.get('PERSONAL_CHAT_ID', 0))
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 GOOGLE_CREDENTIALS = os.environ.get('GOOGLE_CREDENTIALS', '')
 SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID', '')
+PERSONAL_CHAT_ID2 = int(os.environ.get('PERSONAL_CHAT_ID2', 0))
 ACCOUNT_SIZE = 500
 RISK_PERCENT = 0.02
 CACHE_TTL = 900
 TRIAL_DAYS = 7
 TRIAL_MIN_SIGNALS = 5
-TRIAL_MIN_WIN_RATE = 50
+TRIAL_MIN_WIN_RATE = 70
 
 MAX_SCANS_PER_HOUR = 5
 channel_scan_cooldown = {}
@@ -70,7 +73,11 @@ def mark_channel_scanned(username):
 
 def get_sheets():
     try:
-        creds_dict = json.loads(GOOGLE_CREDENTIALS)
+        if GOOGLE_CREDENTIALS:
+            creds_dict = json.loads(GOOGLE_CREDENTIALS)
+        else:
+            with open('/app/credentials.json', 'r') as f:
+                creds_dict = json.load(f)
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         client = gspread.authorize(creds)
@@ -352,8 +359,34 @@ def extract_signal(message_text, channel_name):
         print("extract_signal error: " + str(e))
         return {"is_signal": False}
 
+def is_duplicate_signal(asset, direction, entry):
+    try:
+        sheet = get_sheets()
+        ws = sheet.worksheet('Signals')
+        records = ws.get_all_records()
+        from datetime import timedelta
+        cutoff = datetime.now(BAKU) - timedelta(hours=4)
+        for row in records:
+            if (str(row.get('Asset','')).upper() == str(asset).upper() and
+                str(row.get('Direction','')).upper() == str(direction).upper() and
+                str(row.get('Entry','')) == str(entry)):
+                try:
+                    ts = datetime.strptime(str(row.get('Timestamp',''))[:16], '%Y-%m-%d %H:%M')
+                    ts = BAKU.localize(ts)
+                    if ts > cutoff:
+                        return True
+                except:
+                    pass
+        return False
+    except Exception as e:
+        print("Duplicate check error: " + str(e))
+        return False
+
 def save_signal(signal, channel_name, message_text, status='OPEN'):
     try:
+        if is_duplicate_signal(signal.get('asset'), signal.get('direction'), signal.get('entry')):
+            print("Duplicate signal dropped: " + str(signal.get('asset')) + " " + str(signal.get('direction')) + " @ " + str(signal.get('entry')))
+            return None
         sheet = get_sheets()
         ws = sheet.worksheet('Signals')
         signal_id = str(signal['asset']) + '_' + datetime.now(BAKU).strftime('%Y%m%d%H%M%S')
@@ -427,13 +460,12 @@ async def main():
         system_version="17.0",
         app_version="10.3.2",
         lang_code="en",
-        system_lang_code="en",
-        connection_retries=1,
-        retry_delay=5,
-        auto_reconnect=False
+        system_lang_code="en"
     )
 
     bot_client = TelegramClient('bot_session', API_ID, API_HASH)
+
+
     print("Starting bot client...")
     await bot_client.start(bot_token=BOT_TOKEN)
     bot_client_ref = bot_client
@@ -498,6 +530,38 @@ async def main():
                 username = '@' + data[12:]
                 await event.answer("Channel skipped.")
                 await event.edit("SKIPPED channel: " + username)
+            elif data.startswith('approve_'):
+                username = data[8:]
+                try:
+                    sheet = get_sheets()
+                    ws = sheet.worksheet('SignalChannels')
+                    records = ws.get_all_records()
+                    for i, row in enumerate(records):
+                        if str(row.get('Channel Username', '')).lower().strip() == str(username).lower().strip():
+                            ws.update('C' + str(i + 2), [['TRUE']])
+                            ws.update('E' + str(i + 2), [['ACTIVE']])
+                            invalidate_channel_cache()
+                            break
+                    await event.answer('Channel approved!')
+                    await event.edit('APPROVED: ' + username)
+                except Exception as e:
+                    await event.answer('Error: ' + str(e))
+            elif data.startswith('block_'):
+                username = data[6:]
+                try:
+                    sheet = get_sheets()
+                    ws = sheet.worksheet('SignalChannels')
+                    records = ws.get_all_records()
+                    for i, row in enumerate(records):
+                        if str(row.get('Channel Username', '')).lower().strip() == str(username).lower().strip():
+                            ws.update('C' + str(i + 2), [['FALSE']])
+                            ws.update('E' + str(i + 2), [['BLOCKED']])
+                            invalidate_channel_cache()
+                            break
+                    await event.answer('Channel blocked!')
+                    await event.edit('BLOCKED: ' + username)
+                except Exception as e:
+                    await event.answer('Error: ' + str(e))
         except Exception as e:
             print("Callback error: " + str(e))
 
@@ -507,7 +571,7 @@ async def main():
             if not event.is_channel:
                 return
             chat = await event.get_chat()
-            username = "@" + chat.username if chat.username else str(chat.id)
+            username = "@" + chat.username if chat.username else ("-100" + str(chat.id) if not str(chat.id).startswith('-100') else str(chat.id))
             channel_name = chat.title
 
             if not is_known_channel(username):
@@ -599,13 +663,74 @@ async def main():
                 msg = ("NEW SIGNAL\n\nID: " + str(signal_id) + "\nAsset: " + str(signal.get('asset')) + "\nDirection: " + str(signal.get('direction')) + "\nEntry: " + str(entry) + "\nSL: " + str(sl) + "\nTP1: " + str(signal.get('tp1')) + "\nTP2: " + str(signal.get('tp2')) + "\nAI Score: " + str(validation['score']) + "/10\nLot Size: " + lot_text + " (2% risk / $10)\nChannel Trust: " + trust_label + " (" + str(trust_score) + "% / " + str(total_signals) + " signals)\nChannel: " + str(channel_name) + "\n\nDo you want to track this signal?")
                 buttons = [[Button.inline("✅ Track", data="track_" + signal_id), Button.inline("❌ Skip", data="skip_" + signal_id)]]
                 await bot_client.send_message(PERSONAL_CHAT_ID, msg, buttons=buttons)
+                await bot_client.send_message(PERSONAL_CHAT_ID2, msg)
         except Exception as e:
             print("Error processing message: " + str(e))
 
+
+
     await asyncio.gather(
         user_client.run_until_disconnected(),
-        bot_client.run_until_disconnected()
+        bot_client.run_until_disconnected(),
+        graduation_scheduler(bot_client)
     )
+
+async def daily_trial_graduation(bot_client):
+    try:
+        sheet = get_sheets()
+        ws = sheet.worksheet('SignalChannels')
+        records = ws.get_all_records()
+        now = datetime.now(BAKU)
+        from datetime import timedelta
+        for i, row in enumerate(records):
+            status = str(row.get('Status', '')).upper().strip()
+            if status != 'PENDING':
+                continue
+            trial_start = str(row.get('Trial Start', ''))
+            if not trial_start:
+                continue
+            try:
+                start_dt = datetime.strptime(trial_start[:10], '%Y-%m-%d')
+                days_elapsed = (datetime.now() - start_dt).days
+            except:
+                continue
+            if days_elapsed < TRIAL_DAYS:
+                continue
+            trial_signals = int(row.get('Trial Signals', 0))
+            trial_tp = int(row.get('Trial TP Hits', 0))
+            win_rate = round((trial_tp / trial_signals) * 100, 1) if trial_signals > 0 else 0
+            row_num = i + 2
+            channel_name = str(row.get('Channel Name', ''))
+            username = str(row.get('Channel Username', ''))
+            if trial_signals < TRIAL_MIN_SIGNALS or win_rate < 50:
+                ws.update('C' + str(row_num), [['FALSE']])
+                ws.update('E' + str(row_num), [['BLOCKED']])
+                invalidate_channel_cache()
+                msg = "CHANNEL BLOCKED\n\nChannel: " + channel_name + "\nWin Rate: " + str(win_rate) + "%\nTrial Signals: " + str(trial_signals) + "\nReason: " + ("Low win rate (<50%)" if trial_signals >= TRIAL_MIN_SIGNALS else "Not enough signals (<5)")
+                await bot_client.send_message(PERSONAL_CHAT_ID, msg)
+            elif win_rate >= 70:
+                ws.update('C' + str(row_num), [['TRUE']])
+                ws.update('E' + str(row_num), [['ACTIVE']])
+                invalidate_channel_cache()
+                msg = "CHANNEL ACTIVE\n\nChannel: " + channel_name + "\nWin Rate: " + str(win_rate) + "%\nTrial Signals: " + str(trial_signals) + "\n\nAuto-approved. Now receiving live signal alerts."
+                await bot_client.send_message(PERSONAL_CHAT_ID, msg)
+            else:
+                msg = "CHANNEL REVIEW NEEDED\n\nChannel: " + channel_name + "\nWin Rate: " + str(win_rate) + "% (borderline)\nTrial Signals: " + str(trial_signals) + "\n\nDo you want to approve this channel?"
+                buttons = [[Button.inline("✅ Approve", data="approve_" + username), Button.inline("❌ Block", data="block_" + username)]]
+                await bot_client.send_message(PERSONAL_CHAT_ID, msg, buttons=buttons)
+            print("Channel evaluated: " + channel_name + " win_rate=" + str(win_rate))
+    except Exception as e:
+        print("daily_trial_graduation error: " + str(e))
+
+async def graduation_scheduler(bot_client):
+    while True:
+        now = datetime.now(BAKU)
+        from datetime import timedelta
+        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        wait_seconds = (next_midnight - now).total_seconds()
+        await asyncio.sleep(wait_seconds)
+        await daily_trial_graduation(bot_client)
+
 
 if __name__ == '__main__':
     asyncio.run(main())
